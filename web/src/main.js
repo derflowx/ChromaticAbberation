@@ -30,11 +30,21 @@ const STORE_KEY = 'spectral-ca-settings-v1';
 const state = { ...DEFAULTS, ...loadSettings() };
 
 function loadSettings() {
+  let saved = {};
   try {
-    return JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
+    saved = JSON.parse(localStorage.getItem(STORE_KEY) || '{}') || {};
   } catch {
     return {};
   }
+  // Keep only known keys whose type matches the default (drops NaN/null/undefined).
+  const ok = {};
+  for (const [k, def] of Object.entries(DEFAULTS)) {
+    const v = saved[k];
+    if (typeof v !== typeof def) continue;
+    if (typeof v === 'number' && !Number.isFinite(v)) continue;
+    ok[k] = v;
+  }
+  return ok;
 }
 function saveSettings() {
   try {
@@ -134,34 +144,34 @@ function buildControls() {
       input.value = state[c.key];
       input.addEventListener('input', () => set(c.key, input.value));
     } else {
-      input = document.createElement('input');
-      input.type = 'range';
-      Object.assign(input, { min: c.min, max: c.max, step: c.step });
-      input.value = state[c.key];
+      const range = document.createElement('input');
+      range.type = 'range';
+      Object.assign(range, { min: c.min, max: c.max, step: c.step });
+      range.value = state[c.key];
       const num = document.createElement('input');
       num.type = 'number';
       num.className = 'num';
       Object.assign(num, { min: c.min, max: c.max, step: c.step });
       num.value = state[c.key];
-      input.addEventListener('input', () => {
-        num.value = input.value;
-        set(c.key, parseFloat(input.value));
+      range.addEventListener('input', () => {
+        num.value = range.value;
+        set(c.key, parseFloat(range.value));
       });
       num.addEventListener('change', () => {
         const v = parseFloat(num.value);
         if (Number.isFinite(v)) {
-          input.value = v;
+          range.value = v;
           set(c.key, v);
         }
       });
-      input.addEventListener('dblclick', () => {
-        input.value = num.value = DEFAULTS[c.key];
+      range.addEventListener('dblclick', () => {
+        range.value = num.value = DEFAULTS[c.key];
         set(c.key, DEFAULTS[c.key]);
       });
-      const wrap = document.createElement('span');
-      wrap.className = 'range-wrap';
-      wrap.append(input, num);
-      input = wrap;
+      // Not a <label> target: keeps clicks on the number box from moving the slider.
+      input = document.createElement('span');
+      input.className = 'range-wrap';
+      input.append(range, num);
     }
     if (c.type !== 'checkbox') row.append(input);
     root.append(row);
