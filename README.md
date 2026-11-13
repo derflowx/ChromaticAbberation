@@ -32,7 +32,7 @@ Spectral, not per-RGB-channel:
 - Out-of-gamut spectral colours are kept as float values and only compressed (desaturated to fit) for display.
 - Steps 1–3 plus softness collapse into a cumulative 3×3 kernel, baked on the CPU (`web/src/spectrum.js`). Each shader tap (`web/src/shaders/lateral_ca.wgsl`) integrates its own slice of that kernel, so flat colours are reproduced exactly at any sample count.
 - Tap count adapts to the local spread, so the image centre is nearly free.
-- If a pixel's spread exceeds Max samples, taps read a pre-blurred mip level instead of stepping. More samples looks better.
+- Displaced taps read Gaussian pre-blurred copies of the input (σ 1/2/4 px, built once per image). That removes grid-alignment stripes/spokes and hides the gaps between sparse taps; taps within ~1 px of their original position stay sharp.
 - `amount` = shift between the F (486 nm) and C (656 nm) lines, in pixels, at the image corners.
 
 ## Headless render (testing)

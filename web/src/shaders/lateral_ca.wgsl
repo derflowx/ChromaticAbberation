@@ -10,8 +10,16 @@
 // The kernel is stored cumulatively (C). Per pixel: n radial taps; tap i covers
 // t ∈ [i/n, (i+1)/n] and gets weight C(t1) − C(t0), so taps always sum to I
 // and flat colour regions are reproduced exactly for any n.
-// n adapts to the local spread; if it hits the cap, taps read a pre-blurred
-// mip level matching the tap spacing, so the fringe never breaks into steps.
+// n adapts to the local spread.
+//
+// Source filtering: srcTex is an array of the input, sharp (layer 0) and
+// Gaussian-blurred with σ = 1, 2, 4 px (layers 1–3). Summing many taps along a
+// straight line through the pixel grid of a *sharp* image makes thin features
+// count differently depending on how the line meets the grid → stripes/spokes
+// that no tap count fixes. So displaced taps read a slightly blurred copy
+// (σ ≥ 1 px, invisible inside a smear), and σ also covers the gap between taps
+// (σ ≈ 0.8 × spacing), so taps can be sparse without stepping. Taps within ~1 px
+// of their original position stay sharp, so in-focus detail is untouched.
 
 struct Params {
   center     : vec2f, // optical centre, pixels
@@ -30,7 +38,7 @@ struct Params {
   xMax       : f32,
 };
 
-@group(0) @binding(0) var srcTex  : texture_2d<f32>;
+@group(0) @binding(0) var srcTex  : texture_2d_array<f32>;
 @group(0) @binding(1) var linSamp : sampler;
 @group(0) @binding(2) var outTex  : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> P : Params;
@@ -67,16 +75,30 @@ fn cum(t : f32) -> Rows {
               mix(K[j0 + 2u].xyz, K[j1 + 2u].xyz, a));
 }
 
-// One radial tap at relative shift delta. The source is pre-filtered to this
-// tap's footprint: neighbouring output pixels land |1+δ| px apart sideways and
-// |1+f·δ| px apart radially (f = falloff), so where the image is stretched
-// apart (minified) we read a matching mip level instead of aliasing into spokes.
-// minStepLod covers the spacing between taps along the radius.
-fn tap(v : vec2f, delta : f32, minStepLod : f32) -> vec3f {
+const BLUR_LAYERS = 3.0; // σ = 1, 2, 4
+
+// Sample the input pre-blurred with Gaussian σ (pixels), interpolating layers.
+fn sampleBlurred(uv : vec2f, sigma : f32) -> vec3f {
+  var lf = 0.0;
+  if (sigma >= 1.0) { lf = min(1.0 + log2(sigma), BLUR_LAYERS); } else { lf = max(sigma, 0.0); }
+  let l0 = i32(floor(lf));
+  let f  = lf - f32(l0);
+  let a  = textureSampleLevel(srcTex, linSamp, uv, l0, 0.0).rgb;
+  if (f < 0.001) { return a; }
+  return mix(a, textureSampleLevel(srcTex, linSamp, uv, l0 + 1, 0.0).rgb, f);
+}
+
+// One radial tap at relative shift delta. gapSigma = blur that hides the gap
+// between neighbouring taps. Where the image is stretched apart (neighbouring
+// output pixels land |1+δ| px apart sideways, |1+f·δ| radially), blur to that
+// footprint too.
+fn tap(v : vec2f, delta : f32, gapSigma : f32) -> vec3f {
   let uv = (P.center + v * (1.0 + delta)) / P.size;
+  let shiftPx = abs(delta) * length(v);
   let footprint = max(abs(1.0 + delta), abs(1.0 + P.falloff * delta));
-  let lod = max(minStepLod, log2(max(footprint, 1.0)));
-  return textureSampleLevel(srcTex, linSamp, uv, lod).rgb;
+  let wanted = max(max(1.0, gapSigma), 0.5 * footprint);
+  let sigma = wanted * smoothstep(0.5, 2.0, shiftPx);
+  return sampleBlurred(uv, sigma);
 }
 
 @compute @workgroup_size(8, 8)
@@ -89,13 +111,13 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
   let rpx = length(v);
   let rn  = rpx / P.refRadius;
   let k   = P.amount / P.refRadius * pow(max(rn, 1e-6), P.falloff - 1.0);
-  let alpha = textureLoad(srcTex, vec2i(gid.xy), 0).a;
+  let alpha = textureLoad(srcTex, vec2i(gid.xy), 0, 0).a;
 
   if (P.mode > 0.5) {
     // Classic RGB shift, for comparison: three discrete wavelengths.
-    let r = tap(v, k * dispersion(610.0), 0.0).r;
-    let g = tap(v, k * dispersion(550.0), 0.0).g;
-    let b = tap(v, k * dispersion(465.0), 0.0).b;
+    let r = sampleBlurred((P.center + v * (1.0 + k * dispersion(610.0))) / P.size, 0.0).r;
+    let g = sampleBlurred((P.center + v * (1.0 + k * dispersion(550.0))) / P.size, 0.0).g;
+    let b = sampleBlurred((P.center + v * (1.0 + k * dispersion(465.0))) / P.size, 0.0).b;
     textureStore(outTex, gid.xy, vec4f(r, g, b, alpha));
     return;
   }
@@ -103,9 +125,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
   let spread = rpx * abs(k) * (P.xMax - P.xMin); // pixels
   let n   = u32(clamp(ceil(spread / P.spacing) + 1.0, 3.0, P.maxSamples));
   let fnn = f32(n);
-  // Tap spacing in pixels; above ~0.5 px, prefilter with the matching mip
-  // level (a box of ~2× the tap spacing hides individual taps).
-  let lod = max(0.0, log2(spread / fnn) + 1.0);
+  let gapSigma = 0.8 * spread / fnn; // ~tap spacing, pixels
   let noise = select(0.5, ign(p), P.jitter > 0.5);
 
   var col  = vec3f(0.0);
@@ -118,7 +138,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     prev = next;
     // Tap position jittered inside its own interval.
     let t = (f32(i) + noise) / fnn;
-    let c = tap(v, k * mix(P.xMin, P.xMax, t), lod);
+    let c = tap(v, k * mix(P.xMin, P.xMax, t), gapSigma);
     col += vec3f(dot(kr, c), dot(kg, c), dot(kb, c));
   }
   textureStore(outTex, gid.xy, vec4f(col, alpha));

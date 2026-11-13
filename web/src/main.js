@@ -16,10 +16,10 @@ const DEFAULTS = {
   colB: '#20ff60',
   colC: '#ff2a10',
   softness: 0,
-  spacing: 1,
+  spacing: 2,
   maxSamples: 256,
   gamut: 'compress',
-  jitter: true,
+  jitter: false,
   inputTransfer: 'srgb',
   view: 'result',
   split: 0.5,
@@ -27,7 +27,7 @@ const DEFAULTS = {
   diffGain: 4,
 };
 
-const STORE_KEY = 'spectral-ca-settings-v2';
+const STORE_KEY = 'spectral-ca-settings-v3';
 const state = { ...DEFAULTS, ...loadSettings() };
 
 function loadSettings() {
@@ -78,7 +78,7 @@ const CONTROLS = [
   { key: 'colC', label: 'Long λ (outer)', type: 'color', show: (s) => s.palette === 'custom' },
   { key: 'softness', label: 'Softness', type: 'range', min: 0, max: 3, step: 0.01, show: (s) => s.palette !== 'classic' },
   { section: 'Quality' },
-  { key: 'spacing', label: 'Sample spacing (px)', type: 'range', min: 0.25, max: 4, step: 0.05, show: (s) => s.palette !== 'classic' },
+  { key: 'spacing', label: 'Sample spacing (px)', type: 'range', min: 0.25, max: 8, step: 0.05, show: (s) => s.palette !== 'classic', hint: 'Gaps between samples are hidden by blur; smaller = crisper fringe structure, slower' },
   { key: 'maxSamples', label: 'Max samples', type: 'range', min: 4, max: 1024, step: 1, show: (s) => s.palette !== 'classic', hint: 'Keep above the spread in px to avoid stepping' },
   { key: 'jitter', label: 'Dither samples', type: 'checkbox', show: (s) => s.palette !== 'classic' },
   { section: 'View' },
@@ -206,11 +206,13 @@ function set(key, value) {
 // ---------------------------------------------------------------- GPU
 
 let device, context, canvasFormat;
-let caPipeline, linPipeline, mipPipeline, dispPipeline;
+let caPipeline, linPipeline, blurPipeline, dispPipeline;
 let sampler, kernelBuf, caParams, linParams, viewParams;
-let srcTex, linTex, outTex;
+let srcTex, linTex, tmpTex, outTex;
 let caBG, linBG, dispBG;
-let mipBGs = []; // one bind group per mip level (level i-1 → i)
+let blurPasses = []; // bind groups building the pre-blurred input layers
+let blurParams = []; // uniform buffers: [σ1 H, σ1 V, σ2 H, σ2 V, σ4 H, σ4 V]
+const BLUR_SIGMAS = [1, 2, 4]; // must match BLUR_LAYERS in lateral_ca.wgsl
 let ts = null; // timestamp query resources
 const img = { w: 0, h: 0, name: '' };
 const dirty = { linearize: false, lut: true, ca: false, view: false };
@@ -247,13 +249,13 @@ async function initGPU() {
   canvasFormat = navigator.gpu.getPreferredCanvasFormat();
   context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
 
-  const [caMod, linMod, mipMod, dispMod] = await Promise.all([
+  const [caMod, linMod, blurMod, dispMod] = await Promise.all([
     loadShader('lateral_ca.wgsl'),
     loadShader('linearize.wgsl'),
-    loadShader('downsample.wgsl'),
+    loadShader('blur.wgsl'),
     loadShader('display.wgsl'),
   ]);
-  mipPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: mipMod, entryPoint: 'main' } });
+  blurPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: blurMod, entryPoint: 'main' } });
   caPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: caMod, entryPoint: 'main' } });
   linPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: linMod, entryPoint: 'main' } });
   dispPipeline = device.createRenderPipeline({
@@ -264,7 +266,7 @@ async function initGPU() {
   });
 
   sampler = device.createSampler({
-    magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
+    magFilter: 'linear', minFilter: 'linear',
     addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge',
   });
   kernelBuf = device.createBuffer({
@@ -272,6 +274,19 @@ async function initGPU() {
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
   const ub = (size) => device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  blurParams = [];
+  for (const sigma of BLUR_SIGMAS) {
+    for (const dir of [[1, 0], [0, 1]]) {
+      const b = ub(16);
+      const d = new DataView(new ArrayBuffer(16));
+      d.setInt32(0, dir[0], true);
+      d.setInt32(4, dir[1], true);
+      d.setInt32(8, Math.ceil(sigma * 3), true);
+      d.setFloat32(12, sigma, true);
+      device.queue.writeBuffer(b, 0, d.buffer);
+      blurParams.push(b);
+    }
+  }
   caParams = ub(64);
   linParams = ub(16);
   viewParams = ub(48);
@@ -296,31 +311,30 @@ function setImage(source, name) {
     return;
   }
   $('#error').hidden = true;
-  [srcTex, linTex, outTex].forEach((t) => t && t.destroy());
+  [srcTex, linTex, tmpTex, outTex].forEach((t) => t && t.destroy());
   srcTex = device.createTexture({
     size: [w, h], format: 'rgba8unorm',
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
   });
   device.queue.copyExternalImageToTexture({ source }, { texture: srcTex }, [w, h]);
-  const f16 = (mipLevelCount = 1) => device.createTexture({
-    size: [w, h], format: 'rgba16float', mipLevelCount,
+  const f16 = (layers = 1) => device.createTexture({
+    size: [w, h, layers], format: 'rgba16float',
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
   });
-  const mipCount = Math.floor(Math.log2(Math.max(w, h))) + 1;
-  linTex = f16(mipCount);
+  // linTex layers: 0 = sharp linear input, 1.. = Gaussian blurred (BLUR_SIGMAS).
+  linTex = f16(1 + BLUR_SIGMAS.length);
+  tmpTex = f16();
   outTex = f16();
-  const level = (i) => linTex.createView({ baseMipLevel: i, mipLevelCount: 1 });
-  mipBGs = [];
-  for (let i = 1; i < mipCount; i++) {
-    mipBGs.push({
-      w: Math.max(1, w >> i),
-      h: Math.max(1, h >> i),
-      bg: device.createBindGroup({
-        layout: mipPipeline.getBindGroupLayout(0),
-        entries: [{ binding: 0, resource: level(i - 1) }, { binding: 1, resource: level(i) }],
-      }),
-    });
-  }
+  const level = (i) => linTex.createView({ dimension: '2d', baseArrayLayer: i, arrayLayerCount: 1 });
+  const blurBG = (src, dst, params) => device.createBindGroup({
+    layout: blurPipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: src }, { binding: 1, resource: dst }, { binding: 2, resource: { buffer: params } }],
+  });
+  blurPasses = [];
+  BLUR_SIGMAS.forEach((_, i) => {
+    blurPasses.push(blurBG(level(0), tmpTex.createView(), blurParams[i * 2]));
+    blurPasses.push(blurBG(tmpTex.createView(), level(i + 1), blurParams[i * 2 + 1]));
+  });
 
   linBG = device.createBindGroup({
     layout: linPipeline.getBindGroupLayout(0),
@@ -333,7 +347,7 @@ function setImage(source, name) {
   caBG = device.createBindGroup({
     layout: caPipeline.getBindGroupLayout(0),
     entries: [
-      { binding: 0, resource: linTex.createView() },
+      { binding: 0, resource: linTex.createView({ dimension: '2d-array' }) },
       { binding: 1, resource: sampler },
       { binding: 2, resource: outTex.createView() },
       { binding: 3, resource: { buffer: caParams } },
@@ -436,12 +450,15 @@ function frame() {
     p.setPipeline(linPipeline);
     p.setBindGroup(0, linBG);
     p.dispatchWorkgroups(Math.ceil(img.w / 8), Math.ceil(img.h / 8));
-    p.setPipeline(mipPipeline);
-    for (const m of mipBGs) {
-      p.setBindGroup(0, m.bg);
-      p.dispatchWorkgroups(Math.ceil(m.w / 8), Math.ceil(m.h / 8));
-    }
     p.end();
+    // Separate passes so each blur sees the previous pass's output.
+    for (const bg of blurPasses) {
+      const bp = enc.beginComputePass();
+      bp.setPipeline(blurPipeline);
+      bp.setBindGroup(0, bg);
+      bp.dispatchWorkgroups(Math.ceil(img.w / 8), Math.ceil(img.h / 8));
+      bp.end();
+    }
     dirty.linearize = false;
   }
 

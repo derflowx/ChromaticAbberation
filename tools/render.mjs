@@ -23,7 +23,7 @@ if (!inPath || !outPath) {
 const state = {
   amount: 12, centerX: 0, centerY: 0, falloff: 1, anchor: 550, curve: 1,
   palette: 'spectral', saturation: 1, colA: '#3a2bff', colB: '#20ff60', colC: '#ff2a10',
-  softness: 0, spacing: 1, maxSamples: 256, jitter: true, inputTransfer: 'srgb',
+  softness: 0, spacing: 2, maxSamples: 256, jitter: false, inputTransfer: 'srgb',
 };
 let bench = 0;
 for (let i = 2; i < args.length; i++) {
@@ -54,16 +54,18 @@ const { width: w, height: h } = png;
 
 const srcTex = device.createTexture({ size: [w, h], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
 device.queue.writeTexture({ texture: srcTex }, png.data, { bytesPerRow: w * 4 }, [w, h]);
-const f16 = (extra = 0, mips = 1) => device.createTexture({ size: [w, h], format: 'rgba16float', mipLevelCount: mips, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | extra });
-const mipCount = Math.floor(Math.log2(Math.max(w, h))) + 1;
-const linTex = f16(0, mipCount);
+const BLUR_SIGMAS = [1, 2, 4];
+const f16 = (extra = 0, layers = 1) => device.createTexture({ size: [w, h, layers], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | extra });
+const linTex = f16(0, 1 + BLUR_SIGMAS.length);
+const tmpTex = f16();
 const outTex = f16(GPUTextureUsage.COPY_SRC);
+const layer = (i) => linTex.createView({ dimension: '2d', baseArrayLayer: i, arrayLayerCount: 1 });
 
 const lut = buildFringeLUT(state);
 const kernelBuf = device.createBuffer({ size: lut.data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
 device.queue.writeBuffer(kernelBuf, 0, lut.data);
 
-const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
 const ub = (data) => {
   const b = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   device.queue.writeBuffer(b, 0, data);
@@ -72,7 +74,7 @@ const ub = (data) => {
 
 const linPipe = device.createComputePipeline({ layout: 'auto', compute: { module: await module('linearize.wgsl'), entryPoint: 'main' } });
 const caPipe = device.createComputePipeline({ layout: 'auto', compute: { module: await module('lateral_ca.wgsl'), entryPoint: 'main' } });
-const mipPipe = device.createComputePipeline({ layout: 'auto', compute: { module: await module('downsample.wgsl'), entryPoint: 'main' } });
+const blurPipe = device.createComputePipeline({ layout: 'auto', compute: { module: await module('blur.wgsl'), entryPoint: 'main' } });
 await module('display.wgsl'); // compile check only
 
 const center = [w / 2 + state.centerX * w, h / 2 - state.centerY * h];
@@ -85,10 +87,10 @@ const caParams = ub(new Float32Array([
 const linParams = ub(new Uint32Array([state.inputTransfer === 'srgb' ? 1 : 0, 0, 0, 0]));
 
 const linBG = device.createBindGroup({ layout: linPipe.getBindGroupLayout(0), entries: [
-  { binding: 0, resource: srcTex.createView() }, { binding: 1, resource: linTex.createView({ baseMipLevel: 0, mipLevelCount: 1 }) }, { binding: 2, resource: { buffer: linParams } },
+  { binding: 0, resource: srcTex.createView() }, { binding: 1, resource: layer(0) }, { binding: 2, resource: { buffer: linParams } },
 ] });
 const caBG = device.createBindGroup({ layout: caPipe.getBindGroupLayout(0), entries: [
-  { binding: 0, resource: linTex.createView() }, { binding: 1, resource: sampler }, { binding: 2, resource: outTex.createView() },
+  { binding: 0, resource: linTex.createView({ dimension: '2d-array' }) }, { binding: 1, resource: sampler }, { binding: 2, resource: outTex.createView() },
   { binding: 3, resource: { buffer: caParams } }, { binding: 4, resource: { buffer: kernelBuf } },
 ] });
 
@@ -102,13 +104,17 @@ function pass(enc, pipe, bg, desc = {}, pw = w, ph = h) {
 
 let enc = device.createCommandEncoder();
 pass(enc, linPipe, linBG);
-for (let l = 1; l < mipCount; l++) {
-  const bg = device.createBindGroup({ layout: mipPipe.getBindGroupLayout(0), entries: [
-    { binding: 0, resource: linTex.createView({ baseMipLevel: l - 1, mipLevelCount: 1 }) },
-    { binding: 1, resource: linTex.createView({ baseMipLevel: l, mipLevelCount: 1 }) },
-  ] });
-  pass(enc, mipPipe, bg, {}, Math.max(1, w >> l), Math.max(1, h >> l));
-}
+BLUR_SIGMAS.forEach((sigma, i) => {
+  for (const [dir, src, dst] of [[[1, 0], layer(0), tmpTex.createView()], [[0, 1], tmpTex.createView(), layer(i + 1)]]) {
+    const d = new DataView(new ArrayBuffer(16));
+    d.setInt32(0, dir[0], true); d.setInt32(4, dir[1], true);
+    d.setInt32(8, Math.ceil(sigma * 3), true); d.setFloat32(12, sigma, true);
+    const bg = device.createBindGroup({ layout: blurPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: src }, { binding: 1, resource: dst }, { binding: 2, resource: { buffer: ub(new Uint8Array(d.buffer)) } },
+    ] });
+    pass(enc, blurPipe, bg);
+  }
+});
 pass(enc, caPipe, caBG);
 device.queue.submit([enc.finish()]);
 await device.queue.onSubmittedWorkDone();
