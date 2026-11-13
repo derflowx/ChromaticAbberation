@@ -67,8 +67,15 @@ fn cum(t : f32) -> Rows {
               mix(K[j0 + 2u].xyz, K[j1 + 2u].xyz, a));
 }
 
-fn tap(v : vec2f, delta : f32, lod : f32) -> vec3f {
+// One radial tap at relative shift delta. The source is pre-filtered to this
+// tap's footprint: neighbouring output pixels land |1+δ| px apart sideways and
+// |1+f·δ| px apart radially (f = falloff), so where the image is stretched
+// apart (minified) we read a matching mip level instead of aliasing into spokes.
+// minStepLod covers the spacing between taps along the radius.
+fn tap(v : vec2f, delta : f32, minStepLod : f32) -> vec3f {
   let uv = (P.center + v * (1.0 + delta)) / P.size;
+  let footprint = max(abs(1.0 + delta), abs(1.0 + P.falloff * delta));
+  let lod = max(minStepLod, log2(max(footprint, 1.0)));
   return textureSampleLevel(srcTex, linSamp, uv, lod).rgb;
 }
 
@@ -96,8 +103,8 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
   let spread = rpx * abs(k) * (P.xMax - P.xMin); // pixels
   let n   = u32(clamp(ceil(spread / P.spacing) + 1.0, 3.0, P.maxSamples));
   let fnn = f32(n);
-  // Tap spacing in pixels; above ~1 px, prefilter with the matching mip level.
-  // A box of ~2× the tap spacing hides the individual taps.
+  // Tap spacing in pixels; above ~0.5 px, prefilter with the matching mip
+  // level (a box of ~2× the tap spacing hides individual taps).
   let lod = max(0.0, log2(spread / fnn) + 1.0);
   let noise = select(0.5, ign(p), P.jitter > 0.5);
 

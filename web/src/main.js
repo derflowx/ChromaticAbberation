@@ -72,7 +72,7 @@ const CONTROLS = [
     key: 'palette', label: 'Palette', type: 'select',
     options: [['spectral', 'Spectral (physical)'], ['custom', 'Custom gradient'], ['classic', 'Classic RGB shift']],
   },
-  { key: 'saturation', label: 'Spectral saturation', type: 'range', min: 0, max: 2, step: 0.01, show: (s) => s.palette === 'spectral' },
+  { key: 'saturation', label: 'Fringe saturation', type: 'range', min: 0, max: 2, step: 0.01, show: (s) => s.palette !== 'classic', hint: '0 = grey smear, 1 = physical, >1 = exaggerated' },
   { key: 'colA', label: 'Short λ (inner)', type: 'color', show: (s) => s.palette === 'custom' },
   { key: 'colB', label: 'Middle', type: 'color', show: (s) => s.palette === 'custom' },
   { key: 'colC', label: 'Long λ (outer)', type: 'color', show: (s) => s.palette === 'custom' },
@@ -264,7 +264,7 @@ async function initGPU() {
   });
 
   sampler = device.createSampler({
-    magFilter: 'linear', minFilter: 'linear',
+    magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge',
   });
   kernelBuf = device.createBuffer({

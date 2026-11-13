@@ -28,7 +28,18 @@ fn fetch(t : texture_2d<f32>, ip : vec2f) -> vec4f {
     let c = clamp(vec2i(floor(ip)), vec2i(0), vec2i(V.imageSize) - 1);
     return textureLoad(t, c, 0);
   }
-  return textureSampleLevel(t, linSamp, ip / V.imageSize, 0.0);
+  // Zoomed out: average an n×n grid of bilinear taps over the pixel footprint
+  // so fine fringe detail doesn't alias in the viewer.
+  let fp = 1.0 / V.zoom;
+  let n = min(i32(ceil(fp)), 6);
+  var acc = vec4f(0.0);
+  for (var y = 0; y < n; y++) {
+    for (var x = 0; x < n; x++) {
+      let o = (vec2f(f32(x), f32(y)) + 0.5) / f32(n) - 0.5;
+      acc += textureSampleLevel(t, linSamp, (ip + o * fp) / V.imageSize, 0.0);
+    }
+  }
+  return acc / f32(n * n);
 }
 
 // Bring out-of-gamut (negative) channels to zero by desaturating toward luma,

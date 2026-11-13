@@ -89,12 +89,7 @@ export function projectionFn(settings) {
       return [0, 1, 2].map((k) => cols[j][k] * (1 - f) + cols[j + 1][k] * f);
     };
   }
-  const sat = settings.saturation ?? 1;
-  return (t) => {
-    const c = xyzToLinearSRGB(cieXYZ(LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * t));
-    const y = luma(c);
-    return c.map((v) => y + (v - y) * sat);
-  };
+  return (t) => xyzToLinearSRGB(cieXYZ(LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * t));
 }
 
 function inverse3(m) {
@@ -151,12 +146,40 @@ export function buildFringeLUT(settings) {
     const e = D[j] + hw;
     const i0 = Math.max(0, Math.floor((a - xMin) / binW));
     const i1 = Math.min(LUT_SIZE - 1, Math.floor((e - xMin) / binW));
+    // Box coverage per bin, renormalised so each wavelength deposits exactly
+    // its full weight even where the box is clipped at the range ends.
+    let total = 0;
+    const covers = [];
     for (let i = i0; i <= i1; i++) {
       const lo = Math.max(a, xMin + i * binW);
       const hi = Math.min(e, xMin + (i + 1) * binW);
-      const cover = Math.max(0, hi - lo) / (2 * hw);
+      const cover = Math.max(0, hi - lo);
+      covers.push(cover);
+      total += cover;
+    }
+    if (total <= 0) continue;
+    for (let i = i0; i <= i1; i++) {
+      const cover = covers[i - i0] / total;
       if (cover <= 0) continue;
       for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) acc[i * 9 + r * 3 + c] += wb[r] * b[c] * cover;
+    }
+  }
+
+  // Saturation: blend each bin with its grey version g(x)·I, where g is the
+  // bin's luminance response to white. Totals stay I (Σ g = 1), so flat colours
+  // are still exact. 0 = colourless smear, 1 = physical, > 1 = exaggerated.
+  const sat = settings.saturation ?? 1;
+  if (sat !== 1) {
+    for (let i = 0; i < LUT_SIZE; i++) {
+      const o = i * 9;
+      const rowSum = [0, 1, 2].map((r) => acc[o + r * 3] + acc[o + r * 3 + 1] + acc[o + r * 3 + 2]);
+      const g = luma(rowSum);
+      for (let r = 0; r < 3; r++) {
+        for (let c = 0; c < 3; c++) {
+          const grey = r === c ? g : 0;
+          acc[o + r * 3 + c] = grey + (acc[o + r * 3 + c] - grey) * sat;
+        }
+      }
     }
   }
 
