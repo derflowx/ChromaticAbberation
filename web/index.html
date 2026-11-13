@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spectral Lateral CA</title>
+  <meta name="description" content="Realistic, art-directable spectral chromatic aberration in WebGPU.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <main id="viewport">
+      <canvas id="view"></canvas>
+      <div id="hud"></div>
+      <div id="error" hidden></div>
+    </main>
+    <aside id="panel">
+      <header>
+        <h1>Spectral CA <span class="tag">phase 1 · lateral</span></h1>
+        <div id="gpu" class="muted"></div>
+      </header>
+      <div class="buttons">
+        <label class="btn primary">Load image<input id="file" type="file" accept="image/*" hidden></label>
+        <button id="btn-chart" class="btn">Test chart</button>
+        <button id="btn-fit" class="btn" title="F">Fit</button>
+        <button id="btn-100" class="btn" title="1">100%</button>
+        <button id="btn-reset" class="btn">Reset</button>
+      </div>
+      <pre id="stats"></pre>
+      <div id="controls"></div>
+      <footer class="muted">
+        Drop or paste an image · scroll to zoom · drag to pan · double-click: fit/100% ·
+        hold <kbd>Space</kbd> for original · double-click a slider to reset it.
+      </footer>
+    </aside>
+  </div>
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>

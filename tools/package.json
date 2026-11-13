@@ -1,0 +1,13 @@
+{
+  "name": "spectral-ca-tools",
+  "private": true,
+  "type": "module",
+  "description": "Headless render of the WebGPU shaders via Dawn (node 'webgpu' package).",
+  "scripts": {
+    "render": "node render.mjs"
+  },
+  "dependencies": {
+    "pngjs": "^7.0.0",
+    "webgpu": "^0.3.0"
+  }
+}
