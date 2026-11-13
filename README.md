@@ -23,8 +23,16 @@ Open http://localhost:8000 in Chrome or Edge.
 
 ## How it works
 
-- `web/src/spectrum.js` bakes a 1D **fringe kernel**: CIE 1931 spectrum → linear sRGB, placed along the radius by a dispersion curve (linear ↔ Cauchy glass), optionally box-blurred (softness).
-- `web/src/shaders/lateral_ca.wgsl` takes evenly spaced radial taps per pixel, weighted by that kernel and normalised per channel. Tap count adapts to the local spread, so the image centre is nearly free.
+Spectral, not per-RGB-channel:
+
+1. **Uplift:** each source pixel's RGB becomes a smooth spectrum (3 smooth basis functions that sum to 1, so white = flat spectrum).
+2. **Disperse:** each wavelength is displaced radially by its own amount (dispersion curve: linear ↔ Cauchy glass).
+3. **Project:** the displaced spectra are converted back with the CIE 1931 colour-matching functions into linear sRGB.
+
+- Out-of-gamut spectral colours are kept as float values and only compressed (desaturated to fit) for display.
+- Steps 1–3 plus softness collapse into a cumulative 3×3 kernel, baked on the CPU (`web/src/spectrum.js`). Each shader tap (`web/src/shaders/lateral_ca.wgsl`) integrates its own slice of that kernel, so flat colours are reproduced exactly at any sample count.
+- Tap count adapts to the local spread, so the image centre is nearly free.
+- If a pixel's spread exceeds Max samples, taps read a pre-blurred mip level instead of stepping. More samples looks better.
 - `amount` = shift between the F (486 nm) and C (656 nm) lines, in pixels, at the image corners.
 
 ## Headless render (testing)

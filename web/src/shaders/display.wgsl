@@ -9,7 +9,7 @@ struct View {
   split      : f32,   // 0..1
   exposure   : f32,   // stops
   diffGain   : f32,
-  _pad       : f32,
+  gamut      : f32,   // 0 clip, 1 compress
 };
 
 @group(0) @binding(0) var resultTex : texture_2d<f32>;
@@ -29,6 +29,16 @@ fn fetch(t : texture_2d<f32>, ip : vec2f) -> vec4f {
     return textureLoad(t, c, 0);
   }
   return textureSampleLevel(t, linSamp, ip / V.imageSize, 0.0);
+}
+
+// Bring out-of-gamut (negative) channels to zero by desaturating toward luma,
+// keeping hue and luminance. Spectral colours lie outside sRGB.
+fn gamutCompress(c : vec3f) -> vec3f {
+  let m = min(c.r, min(c.g, c.b));
+  if (V.gamut < 0.5 || m >= 0.0) { return c; }
+  let y = dot(c, vec3f(0.2126, 0.7152, 0.0722));
+  if (y <= 0.0) { return vec3f(0.0); }
+  return y + (c - y) * (y / (y - m));
 }
 
 fn linearToSrgb(c : vec3f) -> vec3f {
@@ -58,5 +68,5 @@ fn fs(@builtin(position) pos : vec4f) -> @location(0) vec4f {
     return vec4f(linearToSrgb(c), 1.0);
   }
 
-  return vec4f(linearToSrgb(c * exp2(V.exposure)), 1.0);
+  return vec4f(linearToSrgb(gamutCompress(c * exp2(V.exposure))), 1.0);
 }

@@ -23,7 +23,7 @@ if (!inPath || !outPath) {
 const state = {
   amount: 12, centerX: 0, centerY: 0, falloff: 1, anchor: 550, curve: 1,
   palette: 'spectral', saturation: 1, colA: '#3a2bff', colB: '#20ff60', colC: '#ff2a10',
-  softness: 0, spacing: 1, maxSamples: 64, jitter: true, inputTransfer: 'srgb',
+  softness: 0, spacing: 1, maxSamples: 256, jitter: true, inputTransfer: 'srgb',
 };
 let bench = 0;
 for (let i = 2; i < args.length; i++) {
@@ -54,13 +54,14 @@ const { width: w, height: h } = png;
 
 const srcTex = device.createTexture({ size: [w, h], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
 device.queue.writeTexture({ texture: srcTex }, png.data, { bytesPerRow: w * 4 }, [w, h]);
-const f16 = (extra = 0) => device.createTexture({ size: [w, h], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | extra });
-const linTex = f16();
+const f16 = (extra = 0, mips = 1) => device.createTexture({ size: [w, h], format: 'rgba16float', mipLevelCount: mips, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | extra });
+const mipCount = Math.floor(Math.log2(Math.max(w, h))) + 1;
+const linTex = f16(0, mipCount);
 const outTex = f16(GPUTextureUsage.COPY_SRC);
 
-const lutTex = device.createTexture({ size: [LUT_SIZE, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
 const lut = buildFringeLUT(state);
-device.queue.writeTexture({ texture: lutTex }, lut.data, { bytesPerRow: LUT_SIZE * 4 }, [LUT_SIZE, 1]);
+const kernelBuf = device.createBuffer({ size: lut.data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+device.queue.writeBuffer(kernelBuf, 0, lut.data);
 
 const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
 const ub = (data) => {
@@ -71,35 +72,43 @@ const ub = (data) => {
 
 const linPipe = device.createComputePipeline({ layout: 'auto', compute: { module: await module('linearize.wgsl'), entryPoint: 'main' } });
 const caPipe = device.createComputePipeline({ layout: 'auto', compute: { module: await module('lateral_ca.wgsl'), entryPoint: 'main' } });
+const mipPipe = device.createComputePipeline({ layout: 'auto', compute: { module: await module('downsample.wgsl'), entryPoint: 'main' } });
 await module('display.wgsl'); // compile check only
 
 const center = [w / 2 + state.centerX * w, h / 2 - state.centerY * h];
 const caParams = ub(new Float32Array([
   center[0], center[1], w, h,
   Math.hypot(w, h) / 2, state.amount, state.anchor, state.curve,
-  state.falloff, 0, state.spacing, state.maxSamples,
+  state.falloff, LUT_SIZE, state.spacing, state.maxSamples,
   state.palette === 'classic' ? 1 : 0, state.jitter ? 1 : 0, lut.xMin, lut.xMax,
 ]));
 const linParams = ub(new Uint32Array([state.inputTransfer === 'srgb' ? 1 : 0, 0, 0, 0]));
 
 const linBG = device.createBindGroup({ layout: linPipe.getBindGroupLayout(0), entries: [
-  { binding: 0, resource: srcTex.createView() }, { binding: 1, resource: linTex.createView() }, { binding: 2, resource: { buffer: linParams } },
+  { binding: 0, resource: srcTex.createView() }, { binding: 1, resource: linTex.createView({ baseMipLevel: 0, mipLevelCount: 1 }) }, { binding: 2, resource: { buffer: linParams } },
 ] });
 const caBG = device.createBindGroup({ layout: caPipe.getBindGroupLayout(0), entries: [
   { binding: 0, resource: linTex.createView() }, { binding: 1, resource: sampler }, { binding: 2, resource: outTex.createView() },
-  { binding: 3, resource: { buffer: caParams } }, { binding: 4, resource: lutTex.createView() },
+  { binding: 3, resource: { buffer: caParams } }, { binding: 4, resource: { buffer: kernelBuf } },
 ] });
 
-function pass(enc, pipe, bg, desc = {}) {
+function pass(enc, pipe, bg, desc = {}, pw = w, ph = h) {
   const p = enc.beginComputePass(desc);
   p.setPipeline(pipe);
   p.setBindGroup(0, bg);
-  p.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
+  p.dispatchWorkgroups(Math.ceil(pw / 8), Math.ceil(ph / 8));
   p.end();
 }
 
 let enc = device.createCommandEncoder();
 pass(enc, linPipe, linBG);
+for (let l = 1; l < mipCount; l++) {
+  const bg = device.createBindGroup({ layout: mipPipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: linTex.createView({ baseMipLevel: l - 1, mipLevelCount: 1 }) },
+    { binding: 1, resource: linTex.createView({ baseMipLevel: l, mipLevelCount: 1 }) },
+  ] });
+  pass(enc, mipPipe, bg, {}, Math.max(1, w >> l), Math.max(1, h >> l));
+}
 pass(enc, caPipe, caBG);
 device.queue.submit([enc.finish()]);
 await device.queue.onSubmittedWorkDone();
@@ -137,16 +146,28 @@ const enc8 = (v) => {
   return Math.round((c <= 0.0031308 ? c * 12.92 : 1.055 * c ** (1 / 2.4) - 0.055) * 255);
 };
 
+// Same gamut compression as display.wgsl: desaturate toward luma just enough
+// to bring negative (out-of-sRGB) channels to zero.
+function gamut(c) {
+  if (state.gamut === 'clip') return c;
+  const m = Math.min(...c);
+  if (m >= 0) return c;
+  const y = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  if (y <= 0) return [0, 0, 0];
+  const k = y / (y - m);
+  return c.map((v) => y + (v - y) * k);
+}
+
 const out = new PNG({ width: w, height: h });
 let nonFinite = 0;
 for (let y = 0; y < h; y++) {
   for (let x = 0; x < w; x++) {
     const i = (y * bpr) / 2 + x * 4;
     const o = (y * w + x) * 4;
+    const c = gamut([h2f(half[i]), h2f(half[i + 1]), h2f(half[i + 2])]);
     for (let k = 0; k < 3; k++) {
-      const v = h2f(half[i + k]);
-      if (!Number.isFinite(v)) nonFinite++;
-      out.data[o + k] = enc8(v);
+      if (!Number.isFinite(c[k])) nonFinite++;
+      out.data[o + k] = enc8(c[k]);
     }
     out.data[o + 3] = 255;
   }

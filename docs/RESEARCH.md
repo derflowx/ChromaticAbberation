@@ -72,6 +72,12 @@ Prototype on the web (WebGPU, GitHub Pages) first, then port to AE.
 - Entrance pupil diameter `D = f / F`; variable vs fixed aperture zooms.
 - Possible extras for us: focus breathing, effective F-number.
 
+## Implemented in phase 1 (lateral CA)
+
+- Spectral pipeline: RGB → smooth spectrum (uplift) → per-λ radial shift → CIE CMF → linear sRGB. Colour-coherent: a red object only fringes in long wavelengths.
+- No per-wavelength clipping (that caused hard colour bands). Out-of-gamut values stay in float; display desaturates to fit.
+- Cumulative 3×3 kernel → each tap integrates its interval → exact identity at any sample count. Stepping appears when taps are > ~1 px apart, so the default cap is 256 samples (≈1–2 ms at 2400×1600 on an RTX 40-series).
+
 ## How we apply it
 
 - **Axial CA:** one gather pass. Per tap, look up the pencil map with (tap's signed defocus, distance / CoC) → RGB weight. Spectral fringe for the cost of one texture fetch per tap, no per-wavelength loop.

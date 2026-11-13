@@ -1,20 +1,27 @@
-// Fringe kernel construction.
+// Spectral fringe kernel.
 //
-// The lateral-CA fringe at a pixel is a 1D radial kernel: each wavelength λ lands
-// at radial offset d(λ) (dispersion) with colour w(λ) (spectrum → RGB). Softness
-// widens every wavelength into a box. All of that is baked on the CPU into a
-// small LUT over offset x ∈ [xMin, xMax], so the shader only takes evenly spaced
-// taps along the radius and weights them. That's deterministic: no noise, no
-// per-wavelength maths per pixel.
+// Physical model per output pixel:
+//   1. Uplift: each source pixel's RGB becomes a smooth spectrum
+//        S(λ) = B(λ) · rgb   (B = 3 smooth basis functions, a partition of unity,
+//                             so white → flat spectrum)
+//   2. Each wavelength is displaced radially by its dispersion d(λ).
+//   3. Project back: out = Σ_λ W(λ) S_λ, with W(λ) = sRGB ← XYZ ← CIE 1931 CMF.
+//      W is signed: spectral colours lie outside sRGB. Nothing is clipped per
+//      wavelength; gamut is handled only when the result is displayed.
 //
-// CIE 1931 2° colour matching functions, analytic multi-lobe fit from
-// Wyman, Sloan & Shirley 2013, "Simple Analytic Approximations to the CIE XYZ
-// Color Matching Functions" (JCGT 2(2)).
+// Because S is linear in rgb, all of that collapses into a 3×3 matrix kernel
+// K(x) over the radial offset x: out = Σ_taps K(x_i) · rgb(x_i). It's baked here
+// (with softness as a box blur along x) into LUT_SIZE bins. The shader samples
+// stored cumulatively; each shader tap integrates its own interval, so any flat
+// colour region is reproduced exactly regardless of the tap count.
+//
+// CIE 1931 2° CMFs: analytic fit from Wyman, Sloan & Shirley 2013,
+// "Simple Analytic Approximations to the CIE XYZ Color Matching Functions", JCGT 2(2).
 
-export const LAMBDA_MIN = 400;
-export const LAMBDA_MAX = 700;
+export const LAMBDA_MIN = 380;
+export const LAMBDA_MAX = 730;
 export const LUT_SIZE = 512;
-const LAMBDA_STEPS = 4096;
+const LAMBDA_STEPS = 2048;
 
 const LAMBDA_F = 0.4861; // µm, Fraunhofer F (blue)
 const LAMBDA_C = 0.6563; // µm, Fraunhofer C (red)
@@ -52,7 +59,14 @@ export function xyzToLinearSRGB([x, y, z]) {
   ];
 }
 
-const luma = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+const sigmoid = (x) => 1 / (1 + Math.exp(-x));
+
+/** RGB → spectrum basis [b_R, b_G, b_B](λ). Smooth, positive, sums to 1. */
+export function upliftBasis(l) {
+  const blue = 1 - sigmoid((l - 490) / 10);
+  const red = sigmoid((l - 590) / 10);
+  return [red, Math.max(0, 1 - red - blue), blue];
+}
 
 export function hexToLinear(hex) {
   const n = parseInt(hex.slice(1), 16);
@@ -62,8 +76,10 @@ export function hexToLinear(hex) {
   });
 }
 
-/** Colour of wavelength-parameter t ∈ [0,1] (0 = 400 nm, 1 = 700 nm). */
-export function paletteFn(settings) {
+const luma = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+
+/** Projection weights W(λ) → linear sRGB, for the palette in `settings`. */
+export function projectionFn(settings) {
   if (settings.palette === 'custom') {
     const cols = [settings.colA, settings.colB, settings.colC].map(hexToLinear);
     return (t) => {
@@ -77,17 +93,46 @@ export function paletteFn(settings) {
   return (t) => {
     const c = xyzToLinearSRGB(cieXYZ(LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * t));
     const y = luma(c);
-    return c.map((v) => Math.max(0, y + (v - y) * sat));
+    return c.map((v) => y + (v - y) * sat);
   };
 }
 
+function inverse3(m) {
+  const [a, b, c, d, e, f, g, h, i] = m;
+  const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+  const det = a * A + b * B + c * C;
+  return [
+    A / det, -(b * i - c * h) / det, (b * f - c * e) / det,
+    B / det, (a * i - c * g) / det, -(a * f - c * d) / det,
+    C / det, -(a * h - b * g) / det, (a * e - b * d) / det,
+  ];
+}
+
 /**
- * Bake the fringe kernel. Returns RGBA8 LUT data over x ∈ [xMin, xMax]
- * (units of normalised dispersion; the shader scales by the per-pixel shift).
+ * Bake the cumulative 3×3 kernel. Returns { data: Float32Array((LUT_SIZE + 1) * 12), xMin, xMax }.
+ * Entry i holds 3 vec4 rows (output R, G, B) = Σ of bins < i, weights for input (r, g, b).
  */
 export function buildFringeLUT(settings) {
   const { anchor, curve, softness = 0 } = settings;
-  const color = paletteFn(settings);
+  const proj = projectionFn(settings);
+
+  // Sample W and B over λ; balance so that Σ W Bᵀ = I (flat colour → unchanged).
+  const W = [];
+  const Bs = [];
+  const D = [];
+  const A = new Array(9).fill(0);
+  for (let j = 0; j < LAMBDA_STEPS; j++) {
+    const t = (j + 0.5) / LAMBDA_STEPS;
+    const l = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * t;
+    const w = proj(t);
+    const b = upliftBasis(l);
+    W.push(w);
+    Bs.push(b);
+    D.push(dispersion(l, anchor, curve));
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) A[r * 3 + c] += w[r] * b[c];
+  }
+  const Ainv = inverse3(A);
+
   const dHi = dispersion(LAMBDA_MIN, anchor, curve);
   const dLo = dispersion(LAMBDA_MAX, anchor, curve);
   const span = dHi - dLo;
@@ -97,31 +142,33 @@ export function buildFringeLUT(settings) {
   const binW = (xMax - xMin) / LUT_SIZE;
   const hw = Math.max(half, binW / 2); // box half-width, at least one bin
 
-  const acc = new Float64Array(LUT_SIZE * 3);
+  const acc = new Float64Array(LUT_SIZE * 9);
   for (let j = 0; j < LAMBDA_STEPS; j++) {
-    const t = (j + 0.5) / LAMBDA_STEPS;
-    const d = dispersion(LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * t, anchor, curve);
-    const c = color(t);
-    const a = d - hw;
-    const b = d + hw;
+    const w = W[j];
+    const wb = [0, 1, 2].map((r) => Ainv[r * 3] * w[0] + Ainv[r * 3 + 1] * w[1] + Ainv[r * 3 + 2] * w[2]);
+    const b = Bs[j];
+    const a = D[j] - hw;
+    const e = D[j] + hw;
     const i0 = Math.max(0, Math.floor((a - xMin) / binW));
-    const i1 = Math.min(LUT_SIZE - 1, Math.floor((b - xMin) / binW));
+    const i1 = Math.min(LUT_SIZE - 1, Math.floor((e - xMin) / binW));
     for (let i = i0; i <= i1; i++) {
       const lo = Math.max(a, xMin + i * binW);
-      const hi = Math.min(b, xMin + (i + 1) * binW);
+      const hi = Math.min(e, xMin + (i + 1) * binW);
       const cover = Math.max(0, hi - lo) / (2 * hw);
-      acc[i * 3] += c[0] * cover;
-      acc[i * 3 + 1] += c[1] * cover;
-      acc[i * 3 + 2] += c[2] * cover;
+      if (cover <= 0) continue;
+      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) acc[i * 9 + r * 3 + c] += wb[r] * b[c] * cover;
     }
   }
 
-  let max = 1e-12;
-  for (const v of acc) max = Math.max(max, v);
-  const data = new Uint8Array(LUT_SIZE * 4);
+  // Store the running total C(t), so a tap covering [t0, t1] gets C(t1) − C(t0):
+  // exact integration for any tap count, and all taps together sum to I.
+  const data = new Float32Array((LUT_SIZE + 1) * 12);
+  const run = new Float64Array(9);
   for (let i = 0; i < LUT_SIZE; i++) {
-    for (let k = 0; k < 3; k++) data[i * 4 + k] = Math.round((acc[i * 3 + k] / max) * 255);
-    data[i * 4 + 3] = 255;
+    for (let m = 0; m < 9; m++) run[m] += acc[i * 9 + m];
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) data[(i + 1) * 12 + r * 4 + c] = run[r * 3 + c];
+    }
   }
   return { data, xMin, xMax };
 }

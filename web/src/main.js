@@ -17,7 +17,8 @@ const DEFAULTS = {
   colC: '#ff2a10',
   softness: 0,
   spacing: 1,
-  maxSamples: 64,
+  maxSamples: 256,
+  gamut: 'compress',
   jitter: true,
   inputTransfer: 'srgb',
   view: 'result',
@@ -26,7 +27,7 @@ const DEFAULTS = {
   diffGain: 4,
 };
 
-const STORE_KEY = 'spectral-ca-settings-v1';
+const STORE_KEY = 'spectral-ca-settings-v2';
 const state = { ...DEFAULTS, ...loadSettings() };
 
 function loadSettings() {
@@ -55,7 +56,7 @@ function saveSettings() {
 }
 
 // What each setting invalidates.
-const VIEW_KEYS = new Set(['view', 'split', 'exposure', 'diffGain']);
+const VIEW_KEYS = new Set(['view', 'split', 'exposure', 'diffGain', 'gamut']);
 const LUT_KEYS = new Set(['palette', 'saturation', 'colA', 'colB', 'colC', 'anchor', 'curve', 'softness']);
 
 const CONTROLS = [
@@ -78,7 +79,7 @@ const CONTROLS = [
   { key: 'softness', label: 'Softness', type: 'range', min: 0, max: 3, step: 0.01, show: (s) => s.palette !== 'classic' },
   { section: 'Quality' },
   { key: 'spacing', label: 'Sample spacing (px)', type: 'range', min: 0.25, max: 4, step: 0.05, show: (s) => s.palette !== 'classic' },
-  { key: 'maxSamples', label: 'Max samples', type: 'range', min: 4, max: 256, step: 1, show: (s) => s.palette !== 'classic' },
+  { key: 'maxSamples', label: 'Max samples', type: 'range', min: 4, max: 1024, step: 1, show: (s) => s.palette !== 'classic', hint: 'Keep above the spread in px to avoid stepping' },
   { key: 'jitter', label: 'Dither samples', type: 'checkbox', show: (s) => s.palette !== 'classic' },
   { section: 'View' },
   {
@@ -88,6 +89,10 @@ const CONTROLS = [
   { key: 'split', label: 'Split position', type: 'range', min: 0, max: 1, step: 0.001, show: (s) => s.view === 'split' },
   { key: 'diffGain', label: 'Difference gain', type: 'range', min: 1, max: 32, step: 0.1, show: (s) => s.view === 'diff' },
   { key: 'exposure', label: 'Exposure (stops)', type: 'range', min: -4, max: 4, step: 0.01 },
+  {
+    key: 'gamut', label: 'Out-of-gamut colours', type: 'select',
+    options: [['compress', 'Compress (desaturate to fit)'], ['clip', 'Clip']],
+  },
   { section: 'Input' },
   { key: 'inputTransfer', label: 'Input encoding', type: 'select', options: [['srgb', 'sRGB (most images)'], ['linear', 'Linear']] },
 ];
@@ -201,10 +206,11 @@ function set(key, value) {
 // ---------------------------------------------------------------- GPU
 
 let device, context, canvasFormat;
-let caPipeline, linPipeline, dispPipeline;
-let sampler, lutTex, caParams, linParams, viewParams;
+let caPipeline, linPipeline, mipPipeline, dispPipeline;
+let sampler, kernelBuf, caParams, linParams, viewParams;
 let srcTex, linTex, outTex;
 let caBG, linBG, dispBG;
+let mipBGs = []; // one bind group per mip level (level i-1 → i)
 let ts = null; // timestamp query resources
 const img = { w: 0, h: 0, name: '' };
 const dirty = { linearize: false, lut: true, ca: false, view: false };
@@ -241,11 +247,13 @@ async function initGPU() {
   canvasFormat = navigator.gpu.getPreferredCanvasFormat();
   context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
 
-  const [caMod, linMod, dispMod] = await Promise.all([
+  const [caMod, linMod, mipMod, dispMod] = await Promise.all([
     loadShader('lateral_ca.wgsl'),
     loadShader('linearize.wgsl'),
+    loadShader('downsample.wgsl'),
     loadShader('display.wgsl'),
   ]);
+  mipPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: mipMod, entryPoint: 'main' } });
   caPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: caMod, entryPoint: 'main' } });
   linPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: linMod, entryPoint: 'main' } });
   dispPipeline = device.createRenderPipeline({
@@ -259,9 +267,9 @@ async function initGPU() {
     magFilter: 'linear', minFilter: 'linear',
     addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge',
   });
-  lutTex = device.createTexture({
-    size: [LUT_SIZE, 1], format: 'rgba8unorm',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  kernelBuf = device.createBuffer({
+    size: (LUT_SIZE + 1) * 12 * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
   const ub = (size) => device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   caParams = ub(64);
@@ -294,18 +302,31 @@ function setImage(source, name) {
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
   });
   device.queue.copyExternalImageToTexture({ source }, { texture: srcTex }, [w, h]);
-  const f16 = () => device.createTexture({
-    size: [w, h], format: 'rgba16float',
+  const f16 = (mipLevelCount = 1) => device.createTexture({
+    size: [w, h], format: 'rgba16float', mipLevelCount,
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
   });
-  linTex = f16();
+  const mipCount = Math.floor(Math.log2(Math.max(w, h))) + 1;
+  linTex = f16(mipCount);
   outTex = f16();
+  const level = (i) => linTex.createView({ baseMipLevel: i, mipLevelCount: 1 });
+  mipBGs = [];
+  for (let i = 1; i < mipCount; i++) {
+    mipBGs.push({
+      w: Math.max(1, w >> i),
+      h: Math.max(1, h >> i),
+      bg: device.createBindGroup({
+        layout: mipPipeline.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: level(i - 1) }, { binding: 1, resource: level(i) }],
+      }),
+    });
+  }
 
   linBG = device.createBindGroup({
     layout: linPipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: srcTex.createView() },
-      { binding: 1, resource: linTex.createView() },
+      { binding: 1, resource: level(0) },
       { binding: 2, resource: { buffer: linParams } },
     ],
   });
@@ -316,14 +337,14 @@ function setImage(source, name) {
       { binding: 1, resource: sampler },
       { binding: 2, resource: outTex.createView() },
       { binding: 3, resource: { buffer: caParams } },
-      { binding: 4, resource: lutTex.createView() },
+      { binding: 4, resource: { buffer: kernelBuf } },
     ],
   });
   dispBG = device.createBindGroup({
     layout: dispPipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: outTex.createView() },
-      { binding: 1, resource: linTex.createView() },
+      { binding: 1, resource: level(0) },
       { binding: 2, resource: sampler },
       { binding: 3, resource: { buffer: viewParams } },
     ],
@@ -350,7 +371,7 @@ function writeCAParams() {
   a.set([
     center[0], center[1], img.w, img.h,
     refRadius, state.amount, state.anchor, state.curve,
-    state.falloff, 0, state.spacing, state.maxSamples,
+    state.falloff, LUT_SIZE, state.spacing, state.maxSamples,
     state.palette === 'classic' ? 1 : 0, state.jitter ? 1 : 0, kernel.xMin, kernel.xMax,
   ]);
   device.queue.writeBuffer(caParams, 0, a);
@@ -367,14 +388,14 @@ function maxSamplesUsed() {
   const rn = r / refRadius;
   const k = (state.amount / refRadius) * Math.pow(Math.max(rn, 1e-6), state.falloff - 1);
   const spread = r * Math.abs(k) * (kernel.xMax - kernel.xMin);
-  return { n: Math.min(Math.max(Math.ceil(spread / state.spacing) + 1, 3), state.maxSamples), spread };
+  const want = Math.max(Math.ceil(spread / state.spacing) + 1, 3);
+  return { n: Math.min(want, state.maxSamples), spread, capped: want > state.maxSamples };
 }
 
 function writeLUT() {
   const lut = buildFringeLUT(state);
   kernel = { xMin: lut.xMin, xMax: lut.xMax };
-  const data = lut.data;
-  device.queue.writeTexture({ texture: lutTex }, data, { bytesPerRow: LUT_SIZE * 4 }, [LUT_SIZE, 1]);
+  device.queue.writeBuffer(kernelBuf, 0, lut.data);
 }
 
 function writeViewParams() {
@@ -383,7 +404,8 @@ function writeViewParams() {
   a.set([
     canvas.width, canvas.height, img.w, img.h,
     viewState.pan[0], viewState.pan[1], viewState.zoom,
-    showOriginal ? 1 : VIEW_MODES[state.view], state.split, state.exposure, state.diffGain, 0,
+    showOriginal ? 1 : VIEW_MODES[state.view], state.split, state.exposure, state.diffGain,
+    state.gamut === 'clip' ? 0 : 1,
   ]);
   device.queue.writeBuffer(viewParams, 0, a);
 }
@@ -414,6 +436,11 @@ function frame() {
     p.setPipeline(linPipeline);
     p.setBindGroup(0, linBG);
     p.dispatchWorkgroups(Math.ceil(img.w / 8), Math.ceil(img.h / 8));
+    p.setPipeline(mipPipeline);
+    for (const m of mipBGs) {
+      p.setBindGroup(0, m.bg);
+      p.dispatchWorkgroups(Math.ceil(m.w / 8), Math.ceil(m.h / 8));
+    }
     p.end();
     dirty.linearize = false;
   }
@@ -469,7 +496,7 @@ function updateStats() {
   const s = maxSamplesUsed();
   const lines = [
     `${img.name || 'image'} · ${img.w}×${img.h}`,
-    state.palette === 'classic' ? 'samples: 3 (classic)' : `max spread ${s.spread.toFixed(1)} px · ${s.n} samples at corners`,
+    state.palette === 'classic' ? 'samples: 3 (classic)' : `max spread ${s.spread.toFixed(1)} px · ${s.n} samples at corners${s.capped ? ' (capped: raise Max samples)' : ''}`,
     gpuMs == null ? (ts ? 'GPU time: measuring…' : 'GPU time: n/a (no timestamp-query)') : `CA pass: ${gpuMs.toFixed(2)} ms`,
   ];
   statsEl.textContent = lines.join('\n');
