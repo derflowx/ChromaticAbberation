@@ -4,19 +4,26 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CA Side by Side</title>
-  <meta name="description" content="WebGPU spectral CA and the WebGL2 prototype, side by side.">
+  <meta name="description" content="WebGPU spectral CA and the WebGL2 prototype, side by side on the same image with matched settings.">
   <style>
-    :root { --bg: #0c0c0e; --panel: #17171a; --text: #e4e4e7; --muted: #8b8b94; --line: #2a2a2f; --accent: #ff7a2f; color-scheme: dark; }
+    :root { --bg: #0c0c0e; --panel: #17171a; --text: #e4e4e7; --muted: #8b8b94; --line: #2a2a2f; --accent: #ff7a2f; --btn: #26262b; color-scheme: dark; }
     @media (prefers-color-scheme: light) {
-      :root:not([data-theme="dark"]) { --bg: #f4f4f5; --panel: #fff; --text: #18181b; --muted: #71717a; --line: #e4e4e7; --accent: #e8590c; color-scheme: light; }
+      :root:not([data-theme="dark"]) { --bg: #f4f4f5; --panel: #fff; --text: #18181b; --muted: #71717a; --line: #e4e4e7; --accent: #e8590c; --btn: #ececee; color-scheme: light; }
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, "Segoe UI", sans-serif; }
     body { display: flex; flex-direction: column; }
-    header { display: flex; gap: 16px; align-items: baseline; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+    header { display: flex; gap: 10px 16px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+    header.dragging { outline: 2px dashed var(--accent); outline-offset: -4px; }
     h1 { font-size: 15px; margin: 0; }
     .muted { color: var(--muted); }
     a { color: var(--accent); }
+    .group { display: flex; gap: 6px; align-items: center; }
+    button { font: inherit; color: var(--text); background: var(--btn); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+    button:hover { border-color: var(--accent); }
+    input[type=range] { width: 160px; accent-color: var(--accent); }
+    input[type=number] { width: 64px; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 2px 4px; }
+    #status { font-size: 12px; }
     main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; min-height: 0; }
     section { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--line); }
     section h2 { font-size: 12px; margin: 0; padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; justify-content: space-between; gap: 8px; }
@@ -25,19 +32,140 @@
   </style>
 </head>
 <body>
-  <header>
+  <header id="bar">
     <h1>Side by side</h1>
-    <span class="muted">Each runs independently. For a fair look, load the same image in both and match settings (WebGL amount ≈ WebGPU amount × −1.54, Clean center 12%, Fringe blur 0, Highlight glow 0).</span>
+    <div class="group">
+      <button id="chart" title="Send the WebGPU test chart to both sides">Test chart → both</button>
+      <button id="open" title="Or drop / paste an image anywhere on this bar">Load image → both…</button>
+      <input type="file" id="file" accept="image/*" hidden>
+    </div>
+    <label class="group" title="Lateral shift at the image corner (WebGPU units). The WebGL side gets the converted value.">
+      Amount
+      <input type="range" id="amt" min="-80" max="80" step="0.1">
+      <input type="number" id="amtNum" step="0.1">
+      <span class="muted">px</span>
+    </label>
+    <button id="match" title="Push matched lateral-only settings to both sides again">Re-match settings</button>
+    <span id="status" class="muted">Waiting for both sides…</span>
   </header>
   <main>
     <section>
       <h2>WebGPU version <a href="./" target="_blank">open full</a></h2>
-      <iframe src="./" title="WebGPU version"></iframe>
+      <iframe id="f-gpu" src="./" title="WebGPU version"></iframe>
     </section>
     <section>
       <h2>WebGL2 prototype <a href="./webgl/" target="_blank">open full</a></h2>
-      <iframe src="./webgl/" title="WebGL2 prototype"></iframe>
+      <iframe id="f-gl" src="./webgl/" title="WebGL2 prototype"></iframe>
     </section>
   </main>
+  <script type="module">
+    import { makeTestChart } from './src/testchart.js';
+
+    // WebGPU "amount" = F–C shift in px at the corner; WebGL "amount" = max shift over 400–700 nm
+    // with the opposite sign convention. Empirical match for Cauchy glass vs. crown (BK7).
+    const GL_PER_GPU = -1.54;
+    const DEFAULT_AMOUNT = 12;
+
+    const frames = { webgpu: document.getElementById('f-gpu'), webgl: document.getElementById('f-gl') };
+    const ready = new Set();
+    const status = document.getElementById('status');
+    const amt = document.getElementById('amt');
+    const amtNum = document.getElementById('amtNum');
+    let amount = DEFAULT_AMOUNT;
+    let image = null; // { blob, name }
+
+    const send = (app, msg) => frames[app].contentWindow.postMessage(msg, location.origin);
+
+    function matched(a) {
+      return {
+        webgpu: {
+          amount: a, falloff: 1, centerX: 0, centerY: 0, anchor: 550, curve: 1,
+          palette: 'spectral', saturation: 1, softness: 0, view: 'result', exposure: 0,
+        },
+        // Lateral CA only: no fringe blur, no glow, no luma restore; falloff ≈ 1 via Clean center 12%.
+        webgl: {
+          amount: a * GL_PER_GPU, blur: 0, clean: 0.12, glow: 0, preserve: 0, streak: 0, mix: 1,
+          sat: 1, hue: 0, focusLambda: 550, falloffBase: 0, glass: 'bk7', palette: 0,
+          quality: 'final', center: [0.5, 0.5], cheap: false,
+        },
+      };
+    }
+
+    function pushSettings() {
+      const m = matched(amount);
+      for (const app of ready) send(app, { type: 'ca-set', values: m[app] });
+      updateStatus();
+    }
+    function pushImage() {
+      if (!image) return;
+      for (const app of ready) send(app, { type: 'ca-image', blob: image.blob, name: image.name });
+      updateStatus();
+    }
+    function updateStatus() {
+      if (ready.size < 2) { status.textContent = `Waiting for both sides… (${[...ready].join(', ') || 'none'} ready)`; return; }
+      status.textContent = `Synced: ${image ? image.name : 'no image'} · WebGPU ${amount} px ↔ WebGL ${(amount * GL_PER_GPU).toFixed(1)} px`;
+    }
+
+    function setAmount(v) {
+      if (!Number.isFinite(v)) return;
+      amount = v;
+      amt.value = amtNum.value = v;
+      pushSettings();
+    }
+    amt.value = amtNum.value = amount;
+    amt.addEventListener('input', () => setAmount(parseFloat(amt.value)));
+    amtNum.addEventListener('change', () => setAmount(parseFloat(amtNum.value)));
+    amt.addEventListener('dblclick', () => setAmount(DEFAULT_AMOUNT));
+
+    function useBlob(blob, name) {
+      if (!blob || !blob.type.startsWith('image/')) return;
+      image = { blob, name };
+      pushImage();
+    }
+    async function useChart() {
+      const blob = await new Promise((r) => makeTestChart().toBlob(r, 'image/png'));
+      useBlob(blob, 'test chart');
+    }
+
+    document.getElementById('chart').addEventListener('click', useChart);
+    document.getElementById('match').addEventListener('click', pushSettings);
+    const file = document.getElementById('file');
+    document.getElementById('open').addEventListener('click', () => file.click());
+    file.addEventListener('change', () => { const f = file.files[0]; if (f) useBlob(f, f.name); file.value = ''; });
+    const bar = document.getElementById('bar');
+    bar.addEventListener('dragover', (e) => { e.preventDefault(); bar.classList.add('dragging'); });
+    bar.addEventListener('dragleave', () => bar.classList.remove('dragging'));
+    bar.addEventListener('drop', (e) => {
+      e.preventDefault();
+      bar.classList.remove('dragging');
+      const f = e.dataTransfer.files[0];
+      if (f) useBlob(f, f.name);
+    });
+    window.addEventListener('paste', (e) => {
+      const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'));
+      if (item) useBlob(item.getAsFile(), 'pasted image');
+    });
+
+    // Each side announces itself once booted; (re)sync it with the current image + settings.
+    window.addEventListener('message', (e) => {
+      if (e.origin !== location.origin || e.data?.type !== 'ca-ready') return;
+      const app = e.data.app;
+      if (!(app in frames) || e.source !== frames[app].contentWindow) return;
+      ready.add(app);
+      if (image) send(app, { type: 'ca-image', blob: image.blob, name: image.name });
+      send(app, { type: 'ca-set', values: matched(amount)[app] });
+      updateStatus();
+    });
+
+    // An iframe may have announced before this module ran; ask again (on load too, for slow iframes).
+    for (const app in frames) {
+      const hello = () => send(app, { type: 'ca-hello' });
+      hello();
+      frames[app].addEventListener('load', hello);
+    }
+
+    useChart();
+    updateStatus();
+  </script>
 </body>
 </html>

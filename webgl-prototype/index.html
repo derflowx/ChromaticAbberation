@@ -532,6 +532,7 @@ cv.addEventListener('pointermove',e=>{ if(dragging){ S.split=Math.min(1,Math.max
 cv.addEventListener('pointerup',()=>dragging=false);
 const srcSel=document.getElementById('source'); let lastSrc='scene';
 srcSel.onchange=()=>{ const v=srcSel.value; if(v==='open'){ srcSel.value=lastSrc; document.getElementById('file').click(); return; }
+  if(v==='shared'){ srcSel.value=lastSrc; return; }
   lastSrc=v; if(v==='scene') setSceneSource(); else setImageSource(v==='test'?testPattern():branches()); };
 function loadImg(f,cb){ if(!f) return; const img=new Image(); img.onload=()=>cb(img); img.src=URL.createObjectURL(f); }
 document.getElementById('file').onchange=e=>loadImg(e.target.files[0],setImageSource);
@@ -545,6 +546,29 @@ addEventListener('dragleave',e=>{ if(e.target===drop) drop.style.display='none';
 addEventListener('drop',e=>{ e.preventDefault(); drop.style.display='none'; loadImg(e.dataTransfer.files[0],setImageSource); });
 
 setPalette(0); applyLook('vintage'); setSceneSource();
+
+// ---------- bridge for compare.html (same-origin parent pushes image / settings) ----------
+function applySettings(v){
+  applyingLook=true;
+  for(const k of Object.keys(ctl)) if(typeof v[k]==='number' && isFinite(v[k])) ctl[k].set(v[k], true);
+  if(v.glass in GLASSES) gsel.value=v.glass;
+  if(Number.isInteger(v.palette)) setPalette(v.palette);
+  if(v.quality in QUALITY) document.getElementById('quality').value=v.quality;
+  if(Array.isArray(v.center)) S.center=v.center.slice(0,2).map(Number);
+  if(typeof v.cheap==='boolean') document.getElementById('cheap').checked=v.cheap;
+  buildLUT(); lsel.value='custom'; applyingLook=false; markDirty();
+}
+addEventListener('message',e=>{
+  if(e.origin!==location.origin || !e.data || typeof e.data!=='object') return;
+  if(e.data.type==='ca-image' && e.data.blob instanceof Blob){
+    loadImg(e.data.blob, img=>{ setImageSource(img); URL.revokeObjectURL(img.src); });
+    let o=[...srcSel.options].find(x=>x.value==='shared'); if(!o){ o=new Option('Shared image','shared'); srcSel.add(o,0); }
+    srcSel.value=lastSrc='shared';
+  } else if(e.data.type==='ca-set') applySettings(e.data.values||{});
+  else if(e.data.type==='ca-hello') announce();
+});
+function announce(){ if(parent!==window) parent.postMessage({type:'ca-ready', app:'webgl'}, location.origin); }
+announce();
 </script>
 </body>
 </html>

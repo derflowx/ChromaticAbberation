@@ -607,15 +607,44 @@ window.addEventListener('keyup', (e) => {
 
 // ---------------------------------------------------------------- loading
 
-async function loadFile(file) {
+async function loadFile(file, name = file?.name) {
   if (!file || !file.type.startsWith('image/')) return;
   try {
     const bmp = await createImageBitmap(file, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
-    setImage(bmp, file.name);
+    setImage(bmp, name);
     bmp.close();
   } catch (err) {
-    fail(`Could not load ${file.name}: ${err.message}`);
+    fail(`Could not load ${name}: ${err.message}`);
   }
+}
+
+/**
+ * Apply settings from outside (compare page). Unknown keys / wrong types are ignored.
+ * Not saved, so the compare page doesn't overwrite the standalone page's remembered settings.
+ */
+function applySettings(values) {
+  for (const [k, v] of Object.entries(values || {})) {
+    if (!(k in DEFAULTS) || typeof v !== typeof DEFAULTS[k]) continue;
+    if (typeof v === 'number' && !Number.isFinite(v)) continue;
+    state[k] = v;
+  }
+  rows.length = 0;
+  buildControls();
+  dirty.lut = dirty.linearize = dirty.ca = dirty.view = true;
+  requestRender();
+}
+
+// Bridge for compare.html: same-origin parent can push an image or settings.
+window.addEventListener('message', (e) => {
+  if (e.origin !== location.origin || !e.data || typeof e.data !== 'object') return;
+  const { type } = e.data;
+  if (type === 'ca-image' && e.data.blob instanceof Blob) loadFile(e.data.blob, e.data.name || 'shared image');
+  else if (type === 'ca-set') applySettings(e.data.values);
+  else if (type === 'ca-hello' && booted) announce();
+});
+let booted = false;
+function announce() {
+  if (window.parent !== window) window.parent.postMessage({ type: 'ca-ready', app: 'webgpu' }, location.origin);
 }
 
 async function loadTestChart() {
@@ -670,4 +699,6 @@ window.addEventListener('paste', (e) => {
   resizeCanvas();
   await loadTestChart();
   window.__ca = { state, set, frame, get gpuMs() { return gpuMs; }, loadTestChart };
+  booted = true;
+  announce();
 })();
