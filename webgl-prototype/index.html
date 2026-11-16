@@ -434,7 +434,7 @@ function allocTargets(){ [S.accum,S.accumFbo,S.tile,S.tileFbo].forEach(del);
   S.accum=tex(S.W,S.H,gl.RGBA16F,gl.RGBA,gl.HALF_FLOAT,gl.NEAREST); S.accumFbo=fbo(S.accum);
   S.tile=tex(Math.ceil(S.W/32),Math.ceil(S.H/32),gl.RGBA16F,gl.RGBA,gl.HALF_FLOAT,gl.NEAREST); S.tileFbo=fbo(S.tile);
   cv.width=S.W; cv.height=S.H; applyZoom(); }
-function clearDepth(){ del(S.depthTex); del(S.depthFbo); S.depthTex=S.depthFbo=null; S.depthMode=0; S.depthKind=null; updateDepthUI(); }
+function clearDepth(){ del(S.depthTex); del(S.depthFbo); S.depthTex=S.depthFbo=null; S.depthMode=0; S.depthKind=null; S.depthSrc=null; updateDepthUI(); }
 function setImageSource(src){ clearDepth(); del(S.colorTex); S.W=src.width||src.naturalWidth; S.H=src.height||src.naturalHeight; S.hdr=false;
   S.colorTex=tex(0,0,gl.SRGB8_ALPHA8,gl.RGBA,gl.UNSIGNED_BYTE,gl.LINEAR,src); allocTargets(); markDirty(); }
 function setSceneSource(){ clearDepth(); del(S.colorTex); S.W=1920; S.H=1080; S.hdr=true;
@@ -449,13 +449,51 @@ function setDepthImage(img){ del(S.depthTex); del(S.depthFbo);
 // ---------- EXR (float HDR colour, or float depth) ----------
 async function isEXR(blob){ const b=new Uint8Array(await blob.slice(0,4).arrayBuffer()); return b[0]===0x76&&b[1]===0x2f&&b[2]===0x31&&b[3]===0x01; }
 let exrMods=null;
-async function decodeEXR(blob){
+// EXRLoader only accepts R+G+B(+A) or a lone Y channel. Depth AOVs (Redshift, Arnold, V-Ray…) usually carry
+// "Z" or "<layer>.Z". For depth loads, rename the best depth channel to "Y" in the header so the stock loader
+// decodes it; if the name length changes, the chunk offset table (absolute file offsets) is shifted to match.
+function exrDepthAsY(buf){
+  const u8=new Uint8Array(buf), dv=new DataView(buf), td=new TextDecoder();
+  const str=p=>{ let e=p; while(u8[e]) e++; return [td.decode(u8.subarray(p,e)), e+1]; };
+  if(dv.getUint32(4,true)&0x1A00) return buf; // tiled (0x200) / deep (0x800) / multi-part (0x1000): leave to the loader
+  let p=8, chAttr=null, comp=0, dw=null;
+  while(u8[p]){ const [name,a]=str(p), [,b]=str(a), size=dv.getInt32(b,true), v=b+4;
+    if(name==='channels') chAttr={start:p, sizeAt:b, v, size};
+    if(name==='compression') comp=u8[v];
+    if(name==='dataWindow') dw=[0,1,2,3].map(i=>dv.getInt32(v+4*i,true));
+    p=v+size; }
+  const headerEnd=p+1; if(!chAttr||!dw) return buf;
+  const chans=[]; for(let q=chAttr.v; u8[q];){ const [n,e]=str(q); chans.push({n,s:q,e:e+16}); q=e+16; }
+  const has=n=>chans.some(c=>c.n===n);
+  if(has('Y') || (has('R')&&has('G')&&has('B'))) return buf;
+  const pick=chans.find(c=>c.n==='Z') || chans.find(c=>/(^|\.)(Z|depth|Depth)$/.test(c.n)) || chans.find(c=>c.n==='R') || chans[0];
+  if(!pick) return buf;
+  const nameBytes=new TextEncoder().encode(pick.n), delta=1-nameBytes.length; // "Y" is 1 byte
+  if(delta===0){ const out=buf.slice(0); new Uint8Array(out)[pick.s]=0x59; return out; }
+  const out=new Uint8Array(u8.length+delta);
+  out.set(u8.subarray(0,pick.s)); out[pick.s]=0x59; out.set(u8.subarray(pick.s+nameBytes.length), pick.s+1);
+  const odv=new DataView(out.buffer); odv.setInt32(chAttr.sizeAt, chAttr.size+delta, true);
+  const lines=[1,1,1,16,32,16,32,32,32,256][comp]||1, n=Math.ceil((dw[3]-dw[1]+1)/lines), tbl=headerEnd+delta;
+  for(let i=0;i<n;i++){ const o=tbl+8*i; odv.setBigUint64(o, odv.getBigUint64(o,true)+BigInt(delta), true); }
+  return out.buffer;
+}
+// Camera focus distance written by Redshift into the EXR header (scene units), or null.
+function exrFocusDistance(buf){
+  const u8=new Uint8Array(buf), dv=new DataView(buf), td=new TextDecoder();
+  const str=p=>{ let e=p; while(u8[e]) e++; return [td.decode(u8.subarray(p,e)), e+1]; };
+  for(let p=8; u8[p];){ const [name,a]=str(p), [type,b]=str(a), size=dv.getInt32(b,true);
+    if(type==='float' && /(^|\/)DOFFocusDistance$/i.test(name)) return dv.getFloat32(b+4,true);
+    p=b+4+size; }
+  return null;
+}
+async function decodeEXR(blob, asDepth=false){
   exrMods ??= Promise.all([import('three'), import('three/addons/loaders/EXRLoader.js')]);
   const [THREE,{EXRLoader}]=await exrMods, ld=new EXRLoader(); ld.setDataType(THREE.FloatType);
-  const r=ld.parse(await blob.arrayBuffer()), w=r.width, h=r.height, ch=r.data.length/(w*h), row=w*ch;
+  let buf=await blob.arrayBuffer(); const focus=exrFocusDistance(buf); if(asDepth) buf=exrDepthAsY(buf);
+  const r=ld.parse(buf), w=r.width, h=r.height, ch=r.data.length/(w*h), row=w*ch;
   const data=new Float32Array(r.data.length); // EXRLoader writes bottom-up; this app keeps row 0 = top
   for(let y=0;y<h;y++) data.set(r.data.subarray((h-1-y)*row,(h-y)*row), y*row);
-  return {w,h,ch,data};
+  return {w,h,ch,data,focus};
 }
 function setHDRImage(e){ clearDepth(); del(S.colorTex); S.W=e.w; S.H=e.h; S.hdr=true;
   let d=e.data; if(e.ch===1){ d=new Float32Array(e.w*e.h*4); for(let i=0;i<e.w*e.h;i++){ d[i*4]=d[i*4+1]=d[i*4+2]=e.data[i]; d[i*4+3]=1; } }
@@ -466,7 +504,11 @@ function setHDRImage(e){ clearDepth(); del(S.colorTex); S.W=e.w; S.H=e.h; S.hdr=
 function setFloatDepth(e){ del(S.depthTex); del(S.depthFbo);
   const z=new Float32Array(e.w*e.h); for(let i=0;i<z.length;i++){ const v=e.data[i*e.ch]; z[i]=Number.isFinite(v)&&v>0?v:1e4; }
   S.depthTex=tex(e.w,e.h,gl.R32F,gl.RED,gl.FLOAT,gl.NEAREST,z); S.depthFbo=fbo(S.depthTex);
-  S.depthMode=2; S.depthKind='float'; S.depthW=e.w; S.depthH=e.h; updateDepthUI(); markDirty(); }
+  S.depthMode=2; S.depthKind='float'; S.depthSrc='exr'; S.depthW=e.w; S.depthH=e.h; updateDepthUI();
+  // Focus where the render's camera focused (Redshift metadata); else on whatever is at the image centre.
+  const f=Number.isFinite(e.focus)&&e.focus>0 ? e.focus : readDepth(0.5,0.5);
+  if(f) ctl.focus.set(Math.max(0,Math.min(1000,sliderFromFocus(Math.min(f,200)))), true);
+  markDirty(); }
 function busy(msg){ document.getElementById('status').textContent=msg; }
 // Colour: EXR → float HDR path, anything else → browser image decoder (8-bit).
 function showLoaded(name){ const sel=document.getElementById('source'); let o=[...sel.options].find(x=>x.value==='shared');
@@ -477,7 +519,7 @@ async function loadColor(blob, name=blob?.name||'Shared image'){ if(!blob) retur
   else loadImg(blob, img=>{ setImageSource(img); URL.revokeObjectURL(img.src); showLoaded(name); }); }
 async function loadDepth(blob){ if(!blob) return;
   if(await isEXR(blob)){ busy('Decoding depth EXR…');
-    try{ const e=await decodeEXR(blob);
+    try{ const e=await decodeEXR(blob, true);
       if(e.w!==S.W||e.h!==S.H) alert(`Depth EXR is ${e.w}×${e.h}, image is ${S.W}×${S.H}; it will be stretched to fit.`);
       setFloatDepth(e); } catch(err){ console.error(err); busy(''); alert('Could not read this depth EXR: '+err.message); } }
   else loadImg(blob,setDepthImage); }
@@ -486,7 +528,8 @@ function readDepth(u,v){ if(!S.depthMode) return null; gl.bindFramebuffer(gl.FRA
   if(S.depthKind==='float'){ const b=new Float32Array(4); gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,b); return b[0]; }
   const b=new Uint8Array(4); gl.readPixels(x,y,1,1,gl.RGBA,gl.UNSIGNED_BYTE,b); let n=b[0]/255; if(document.getElementById('depthInvert').checked) n=1-n; return val.near+(val.far-val.near)*n; }
 function updateDepthUI(){
-  document.getElementById('depthState').textContent = S.depthMode===2 ? 'Using the scene’s built-in depth (float, metres).' : S.depthMode===1 ? 'Using your 8-bit depth map.' : 'No depth: fringes use “Fringe blur” only. Load a depth map for real focus.';
+  document.getElementById('depthState').textContent = S.depthMode===2 && S.depthSrc==='exr' ? 'Using your float depth EXR (scene units; only ratios matter for blur).'
+    : S.depthMode===2 ? 'Using the scene’s built-in depth (float, metres).' : S.depthMode===1 ? 'Using your 8-bit depth map.' : 'No depth: fringes use “Fringe blur” only. Load a depth map for real focus.';
   document.getElementById('byteDepth').classList.toggle('hidden', S.depthMode!==1);
   if(S.depthMode) document.getElementById('depthSec').open=true;
 }
