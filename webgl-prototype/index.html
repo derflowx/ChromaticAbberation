@@ -57,7 +57,7 @@
     <div class="seg" id="compare"><button data-v="before">Before</button><button data-v="after" class="on">After</button><button data-v="split">Split</button></div>
     <div class="seg" id="viewmode"><button data-v="0" class="on">Image</button><button data-v="1">Blur map</button><button data-v="2">Depth</button></div>
     <div class="sep"></div>
-    <select id="source"><option value="scene">3D scene (HDR + depth)</option><option value="ztest">Ztest render (EXR + depth)</option><option value="test">Test pattern</option><option value="branches">Branches</option><option value="open">Open image / EXR…</option></select>
+    <select id="source"><option value="scene">3D scene (HDR + depth)</option><option value="ztest">Ztest render (EXR + depth)</option><option value="room">Room render (EXR + depth)</option><option value="test">Test pattern</option><option value="branches">Branches</option><option value="open">Open image / EXR…</option></select>
     <select id="zoom"><option value="fit">Fit</option><option value="1">100%</option><option value="2">200%</option><option value="4">400%</option></select>
     <button class="btn" id="save">Save PNG</button>
     <input type="file" id="file" accept="image/*,.exr" class="hidden">
@@ -712,12 +712,14 @@ const srcSel=document.getElementById('source'); let lastSrc='scene';
 srcSel.onchange=()=>{ const v=srcSel.value; if(v==='open'){ srcSel.value=lastSrc; document.getElementById('file').click(); return; }
   if(v==='shared'){ srcSel.value=lastSrc; return; }
   lastSrc=v; try{ localStorage.setItem('ca-gl-source',v); }catch{}
-  if(v==='scene') setSceneSource(); else if(v==='ztest') loadZtest(); else setImageSource(v==='test'?testPattern():branches()); };
-// Built-in test render: C4D/Redshift beauty + float Z depth (served next to this page under assets/).
-async function loadZtest(){ busy('Loading Ztest render…');
-  try{ const [b,d]=await Promise.all(['assets/ztest_beauty.exr','assets/ztest_depth.exr'].map(async u=>{ const r=await fetch(u); if(!r.ok) throw Error(`${u}: HTTP ${r.status}`); return r.blob(); }));
+  if(v==='scene') setSceneSource(); else if(v in RENDERS) loadRender(v); else setImageSource(v==='test'?testPattern():branches()); };
+// Built-in test renders: C4D/Redshift beauty + float Z depth (served next to this page under assets/).
+const RENDERS={ ztest:'Ztest', room:'Room' };
+async function loadRender(k){ busy(`Loading ${RENDERS[k]} render…`);
+  try{ const [b,d]=await Promise.all([`assets/${k}_beauty.exr`,`assets/${k}_depth.exr`].map(async u=>{ const r=await fetch(u); if(!r.ok) throw Error(`${u}: HTTP ${r.status}`); return r.blob(); }));
+    if(srcSel.value!==k) return;                         // user picked something else meanwhile
     setHDRImage(await decodeEXR(b)); await loadDepth(d); }
-  catch(err){ console.error(err); busy(''); alert('Could not load the Ztest render: '+err.message); } }
+  catch(err){ console.error(err); busy(''); alert(`Could not load the ${RENDERS[k]} render: `+err.message); } }
 function loadImg(f,cb){ if(!f) return; const img=new Image(); img.onload=()=>cb(img); img.src=URL.createObjectURL(f); }
 document.getElementById('file').onchange=e=>{ loadColor(e.target.files[0]); e.target.value=''; };
 document.getElementById('loadDepth').onclick=()=>document.getElementById('depthFile').click();
@@ -732,7 +734,7 @@ addEventListener('drop',e=>{ e.preventDefault(); drop.style.display='none'; load
 setPalette(0); applyLook('vintage');
 { let s='scene'; try{ s=localStorage.getItem('ca-gl-source')||s; }catch{}
   if(parent!==window || ![...srcSel.options].some(o=>o.value===s&&!['open','shared'].includes(s))) s='scene';
-  srcSel.value=lastSrc=s; if(s==='scene') setSceneSource(); else if(s==='ztest'){ setSceneSource(); loadZtest(); } else setImageSource(s==='test'?testPattern():branches()); }
+  srcSel.value=lastSrc=s; if(s==='scene') setSceneSource(); else if(s in RENDERS){ setSceneSource(); loadRender(s); } else setImageSource(s==='test'?testPattern():branches()); }
 
 // ---------- bridge for compare.html (same-origin parent pushes image / settings) ----------
 function applySettings(v){
