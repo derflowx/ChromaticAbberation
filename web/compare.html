@@ -46,6 +46,7 @@
       <span class="muted">px</span>
     </label>
     <button id="match" title="Push matched lateral-only settings to both sides again">Re-match settings</button>
+    <label class="group" title="Zoom/pan on either side follows on the other"><input type="checkbox" id="linkView" checked> Link zoom &amp; pan</label>
     <span id="status" class="muted">Waiting for both sides…</span>
   </header>
   <main>
@@ -129,6 +130,12 @@
 
     document.getElementById('chart').addEventListener('click', useChart);
     document.getElementById('match').addEventListener('click', pushSettings);
+    // Re-linking: snap both sides to whichever view moved last.
+    document.getElementById('linkView').addEventListener('change', (e) => {
+      if (!e.target.checked || !lastView) return;
+      const { fit, scale, u, v } = lastView;
+      for (const app of ready) send(app, { type: 'ca-view', fit, scale, u, v });
+    });
     const file = document.getElementById('file');
     document.getElementById('open').addEventListener('click', () => file.click());
     file.addEventListener('change', () => { const f = file.files[0]; if (f) useBlob(f, f.name); file.value = ''; });
@@ -147,8 +154,21 @@
     });
 
     // Each side announces itself once booted; (re)sync it with the current image + settings.
+    const linkView = document.getElementById('linkView');
+    let lastView = null;
     window.addEventListener('message', (e) => {
-      if (e.origin !== location.origin || e.data?.type !== 'ca-ready') return;
+      if (e.origin !== location.origin) return;
+      // Zoom/pan from one side → mirror to the other.
+      if (e.data?.type === 'ca-view') {
+        const from = Object.keys(frames).find((k) => frames[k].contentWindow === e.source);
+        if (!from) return;
+        lastView = e.data;
+        if (!linkView.checked) return;
+        const { fit, scale, u, v } = e.data;
+        for (const app of ready) if (app !== from) send(app, { type: 'ca-view', fit, scale, u, v });
+        return;
+      }
+      if (e.data?.type !== 'ca-ready') return;
       const app = e.data.app;
       if (!(app in frames) || e.source !== frames[app].contentWindow) return;
       ready.add(app);

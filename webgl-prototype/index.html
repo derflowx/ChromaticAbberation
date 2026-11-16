@@ -11,8 +11,8 @@
   #stage { flex:1; display:flex; flex-direction:column; min-width:0; }
   #toolbar { display:flex; gap:8px; align-items:center; padding:8px 10px; border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
   #toolbar .sep { width:1px; height:20px; background:var(--line); }
-  #view { flex:1; overflow:auto; position:relative; display:flex; }
-  #view canvas { margin:auto; display:block; image-rendering:pixelated; cursor:crosshair; }
+  #view { flex:1; min-height:0; overflow:auto; position:relative; display:flex; }
+  #view canvas { margin:auto; display:block; image-rendering:pixelated; cursor:grab; }
   #status { position:absolute; left:10px; bottom:8px; color:var(--dim); font-variant-numeric:tabular-nums; pointer-events:none; text-shadow:0 1px 2px #000; }
   #panel { width:300px; background:var(--panel); border-left:1px solid var(--line); overflow-y:auto; padding:12px 14px 28px; }
   .seg { display:inline-flex; background:var(--panel2); border:1px solid var(--line); border-radius:7px; padding:2px; gap:2px; }
@@ -43,7 +43,7 @@
   #plot { width:100%; height:80px; display:block; background:#111216; border-radius:6px; margin:6px 0 2px; }
   #drop { position:absolute; inset:0; display:none; align-items:center; justify-content:center; background:#000a; font-size:18px; }
   .hidden { display:none !important; }
-  @media (max-width:760px){ body{flex-direction:column; height:auto; overflow:auto;} #panel{width:100%;} #view{height:60vh;} }
+  @media (max-width:760px){ body{flex-direction:column; height:auto; overflow:auto;} #panel{width:100%;} #view{flex:none; height:60vh;} }
 </style>
 </head>
 <body>
@@ -66,7 +66,7 @@
   <div class="hint">Double-click a label to reset it. Type any value into a number field to go past the slider's range.</div>
 
   <div id="g-main"></div>
-  <div class="hint">Shift-click the image to set the lens center. <a href="#" id="resetCenter" style="color:var(--acc)">Recenter</a></div>
+  <div class="hint">Scroll to zoom, drag to pan (middle-drag in Split), double-click for Fit ↔ 100%. Shift-click the image to set the lens center. <a href="#" id="resetCenter" style="color:var(--acc)">Recenter</a></div>
 
   <div class="sec">Fringe colors</div>
   <div class="seg full" id="palette"><button data-v="0" class="on">Natural</button><button data-v="1">Shifted</button><button data-v="2">Two-color</button></div>
@@ -518,18 +518,56 @@ function setPalette(v){ S.palette=v; document.querySelectorAll('#palette button'
 lsel.onchange=()=>applyLook(lsel.value);
 gsel.onchange=()=>{ buildLUT(); lsel.value='custom'; markDirty(); };
 document.getElementById('resetCenter').onclick=e=>{ e.preventDefault(); S.center=[0.5,0.5]; markDirty(); };
-function applyZoom(){ const z=document.getElementById('zoom').value, view=document.getElementById('view');
-  if(z==='fit'){ const s=Math.min((view.clientWidth-16)/S.W,(view.clientHeight-16)/S.H); cv.style.width=S.W*s+'px'; cv.style.height=S.H*s+'px'; }
-  else { cv.style.width=S.W*z/devicePixelRatio+'px'; cv.style.height=S.H*z/devicePixelRatio+'px'; } }
-document.getElementById('zoom').onchange=applyZoom; addEventListener('resize',applyZoom);
-let dragging=false;
+// ---------- view: wheel zoom around the cursor, drag to pan (scroll container), synced with compare.html ----------
+const viewEl=document.getElementById('view'), zsel=document.getElementById('zoom');
+let viewScale=null; // CSS px per image px; null = fit
+const fitScale=()=>Math.min((viewEl.clientWidth-16)/S.W,(viewEl.clientHeight-16)/S.H);
+const curScale=()=>viewScale ?? fitScale();
+function applyZoom(){ const s=curScale(); cv.style.width=S.W*s+'px'; cv.style.height=S.H*s+'px'; }
+function updateZoomLabel(){
+  if(viewScale==null){ zsel.value='fit'; return; }
+  const pct=Math.round(viewScale*devicePixelRatio*100), preset=[...zsel.options].find(o=>+o.value*100===pct);
+  if(preset){ zsel.value=preset.value; return; }
+  let o=zsel.querySelector('option[value=custom]'); if(!o){ o=new Option('','custom'); zsel.add(o); }
+  o.textContent=pct+'%'; zsel.value='custom'; }
+// Image point (0..1) at the centre of the view.
+function viewCenter(){ const vr=viewEl.getBoundingClientRect(), cr=cv.getBoundingClientRect();
+  return [(vr.left+viewEl.clientWidth/2-cr.left)/cr.width,(vr.top+viewEl.clientHeight/2-cr.top)/cr.height]; }
+// Set scale, then scroll so image point (u,v) lands at screen point (sx,sy) (default: view centre).
+let quietScrollUntil=0;
+function setView(scale,u,v,sx,sy){ const vr=viewEl.getBoundingClientRect();
+  sx??=vr.left+viewEl.clientWidth/2; sy??=vr.top+viewEl.clientHeight/2;
+  viewScale=scale==null?null:Math.min(64/devicePixelRatio,Math.max(0.02,scale)); applyZoom();
+  const cr=cv.getBoundingClientRect(); viewEl.scrollLeft+=cr.left+u*cr.width-sx; viewEl.scrollTop+=cr.top+v*cr.height-sy;
+  quietScrollUntil=performance.now()+150; updateZoomLabel(); }
+let applyingView=false;
+function emitView(){ if(parent===window||applyingView) return; const [u,v]=viewCenter();
+  parent.postMessage({type:'ca-view', fit:viewScale==null, scale:curScale(), u, v}, location.origin); }
+function applyView(m){ applyingView=true;
+  if(m.fit) setView(null,0.5,0.5); else if([m.scale,m.u,m.v].every(Number.isFinite)) setView(m.scale,m.u,m.v);
+  applyingView=false; }
+zsel.onchange=()=>{ if(zsel.value==='custom') return; const [u,v]=viewCenter(); setView(zsel.value==='fit'?null:+zsel.value/devicePixelRatio,u,v); emitView(); };
+addEventListener('resize',applyZoom);
+viewEl.addEventListener('wheel',e=>{ e.preventDefault(); const cr=cv.getBoundingClientRect();
+  const u=(e.clientX-cr.left)/cr.width, v=(e.clientY-cr.top)/cr.height;
+  setView(curScale()*Math.exp(-e.deltaY*0.0015),u,v,e.clientX,e.clientY); emitView(); },{passive:false});
+viewEl.addEventListener('scroll',()=>{ if(performance.now()>quietScrollUntil) emitView(); });
+let dragging=false, pan=null;
 const uv=e=>{ const r=cv.getBoundingClientRect(); return [(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height]; };
 cv.addEventListener('pointerdown',e=>{ const [u,v]=uv(e);
-  if(e.shiftKey){ S.center=[u,v]; markDirty(); }
+  if(e.button===1 || (e.button===0 && !e.shiftKey && !e.altKey && S.compare!=='split')){ // pan (middle-drag always works)
+    e.preventDefault(); pan={x:e.clientX,y:e.clientY,sl:viewEl.scrollLeft,st:viewEl.scrollTop}; cv.style.cursor='grabbing'; cv.setPointerCapture(e.pointerId); }
+  else if(e.button!==0) return;
+  else if(e.shiftKey){ S.center=[u,v]; markDirty(); }
   else if(e.altKey){ const z=readDepth(u,v); if(z!=null){ ctl.focus.set(Math.max(0,Math.min(1000,sliderFromFocus(Math.min(z,200))))); } }
   else if(S.compare==='split'){ dragging=true; S.split=u; markDirty(); cv.setPointerCapture(e.pointerId); } });
-cv.addEventListener('pointermove',e=>{ if(dragging){ S.split=Math.min(1,Math.max(0,uv(e)[0])); markDirty(); } });
-cv.addEventListener('pointerup',()=>dragging=false);
+cv.addEventListener('pointermove',e=>{
+  if(pan){ viewEl.scrollLeft=pan.sl-(e.clientX-pan.x); viewEl.scrollTop=pan.st-(e.clientY-pan.y); }
+  else if(dragging){ S.split=Math.min(1,Math.max(0,uv(e)[0])); markDirty(); } });
+cv.addEventListener('pointerup',()=>{ dragging=false; if(pan){ pan=null; cv.style.cursor=''; } });
+cv.addEventListener('mousedown',e=>{ if(e.button===1) e.preventDefault(); }); // no autoscroll
+cv.addEventListener('dblclick',e=>{ if(e.shiftKey||e.altKey) return; const [u,v]=uv(e);
+  setView(viewScale==null?1/devicePixelRatio:null,u,v,viewScale==null?e.clientX:undefined,viewScale==null?e.clientY:undefined); emitView(); });
 const srcSel=document.getElementById('source'); let lastSrc='scene';
 srcSel.onchange=()=>{ const v=srcSel.value; if(v==='open'){ srcSel.value=lastSrc; document.getElementById('file').click(); return; }
   if(v==='shared'){ srcSel.value=lastSrc; return; }
@@ -565,6 +603,7 @@ addEventListener('message',e=>{
     let o=[...srcSel.options].find(x=>x.value==='shared'); if(!o){ o=new Option('Shared image','shared'); srcSel.add(o,0); }
     srcSel.value=lastSrc='shared';
   } else if(e.data.type==='ca-set') applySettings(e.data.values||{});
+  else if(e.data.type==='ca-view') applyView(e.data);
   else if(e.data.type==='ca-hello') announce();
 });
 function announce(){ if(parent!==window) parent.postMessage({type:'ca-ready', app:'webgl'}, location.origin); }

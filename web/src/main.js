@@ -520,7 +520,7 @@ function updateStats() {
 }
 
 function updateHud() {
-  const pct = Math.round(viewState.zoom * window.devicePixelRatio * 100);
+  const pct = Math.round(viewState.zoom * 100); // zoom = screen (device) px per image px
   const mode = holdingSpace ? 'ORIGINAL (space)' : state.view.toUpperCase();
   hud.textContent = `${pct}% · ${mode}`;
 }
@@ -542,12 +542,37 @@ function fitView() {
   viewState.zoom = Math.min(canvas.width / img.w, canvas.height / img.h) * 0.98;
   viewState.pan = [img.w / 2, img.h / 2];
   requestRender();
+  emitView();
 }
 
 function actualPixels() {
   viewState.fit = false;
-  viewState.zoom = window.devicePixelRatio || 1; // 1 image px per CSS px
+  viewState.zoom = 1; // 1 image px per screen pixel, same as the WebGL prototype's 100%
   requestRender();
+  emitView();
+}
+
+// View sync for compare.html: scale = CSS px per image px, (u, v) = image point at the view centre (0..1).
+let applyingView = false;
+function emitView() {
+  if (window.parent === window || applyingView || !img.w) return;
+  const dpr = window.devicePixelRatio || 1;
+  window.parent.postMessage({
+    type: 'ca-view', fit: viewState.fit, scale: viewState.zoom / dpr,
+    u: viewState.pan[0] / img.w, v: viewState.pan[1] / img.h,
+  }, location.origin);
+}
+function applyView(m) {
+  if (!img.w) return;
+  applyingView = true;
+  if (m.fit) fitView();
+  else if ([m.scale, m.u, m.v].every(Number.isFinite)) {
+    viewState.fit = false;
+    viewState.zoom = Math.min(64, Math.max(0.02, m.scale * (window.devicePixelRatio || 1)));
+    viewState.pan = [m.u * img.w, m.v * img.h];
+    requestRender();
+  }
+  applyingView = false;
 }
 
 let holdingSpace = false;
@@ -569,6 +594,7 @@ canvas.addEventListener('wheel', (e) => {
   ];
   viewState.fit = false;
   requestRender();
+  emitView();
 }, { passive: false });
 
 canvas.addEventListener('pointerdown', (e) => {
@@ -583,6 +609,7 @@ canvas.addEventListener('pointermove', (e) => {
   drag = { x: e.clientX, y: e.clientY };
   viewState.fit = false;
   requestRender();
+  emitView();
 });
 canvas.addEventListener('pointerup', () => { drag = null; });
 canvas.addEventListener('dblclick', () => (viewState.fit ? actualPixels() : fitView()));
@@ -640,6 +667,7 @@ window.addEventListener('message', (e) => {
   const { type } = e.data;
   if (type === 'ca-image' && e.data.blob instanceof Blob) loadFile(e.data.blob, e.data.name || 'shared image');
   else if (type === 'ca-set') applySettings(e.data.values);
+  else if (type === 'ca-view') applyView(e.data);
   else if (type === 'ca-hello' && booted) announce();
 });
 let booted = false;
@@ -698,7 +726,7 @@ window.addEventListener('paste', (e) => {
   new ResizeObserver(resizeCanvas).observe(canvas);
   resizeCanvas();
   await loadTestChart();
-  window.__ca = { state, set, frame, get gpuMs() { return gpuMs; }, loadTestChart };
+  window.__ca = { state, set, frame, get gpuMs() { return gpuMs; }, loadTestChart, viewState };
   booted = true;
   announce();
 })();
