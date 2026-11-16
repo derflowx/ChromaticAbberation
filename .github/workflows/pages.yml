@@ -32,6 +32,7 @@ jobs:
           cp -r web/. _site/
           mkdir -p _site/webgl
           cp webgl-prototype/index.html _site/webgl/index.html
+          cp -r webgl-prototype/assets _site/webgl/assets
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

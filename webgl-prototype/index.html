@@ -57,9 +57,8 @@
     <div class="seg" id="compare"><button data-v="before">Before</button><button data-v="after" class="on">After</button><button data-v="split">Split</button></div>
     <div class="seg" id="viewmode"><button data-v="0" class="on">Image</button><button data-v="1">Blur map</button><button data-v="2">Depth</button></div>
     <div class="sep"></div>
-    <select id="source"><option value="scene">3D scene (HDR + depth)</option><option value="test">Test pattern</option><option value="branches">Branches</option><option value="open">Open image / EXR…</option></select>
+    <select id="source"><option value="scene">3D scene (HDR + depth)</option><option value="ztest">Ztest render (EXR + depth)</option><option value="test">Test pattern</option><option value="branches">Branches</option><option value="open">Open image / EXR…</option></select>
     <select id="zoom"><option value="fit">Fit</option><option value="1">100%</option><option value="2">200%</option><option value="4">400%</option></select>
-    <select id="quality"><option value="draft">Draft</option><option value="good" selected>Good</option><option value="final">Final</option></select>
     <button class="btn" id="save">Save PNG</button>
     <input type="file" id="file" accept="image/*,.exr" class="hidden">
   </div>
@@ -72,6 +71,10 @@
 
   <div id="g-main"></div>
   <div class="hint">Scroll to zoom, drag to pan (middle-drag in Split), double-click for Fit ↔ 100%. Shift-click the image to set the lens center. <a href="#" id="resetCenter" style="color:var(--acc)">Recenter</a></div>
+
+  <div class="sec">Render</div>
+  <div id="g-render"></div>
+  <div class="hint">Each sample is one full pass (64 spectral + lens rays per pixel). The image only updates when every sample is done, and the status line shows how long the frame took.</div>
 
   <div class="sec">Fringe colors</div>
   <div class="seg full" id="palette"><button data-v="0" class="on">Natural</button><button data-v="1">Shifted</button><button data-v="2">Two-color</button></div>
@@ -108,31 +111,38 @@
 // =====================================================================
 const val = {}, ctl = {};
 function control(host, o){
-  const {id,label,min,max,step,def,unit='',hard=[-Infinity,Infinity],disp=v=>v,undisp=v=>v,decimals=1} = o;
+  const {id,label,min,max,step,def,unit='',hard=[-Infinity,Infinity],disp=v=>v,undisp=v=>v,decimals=1,curve=1} = o;
   const el = document.createElement('div'); el.className='ctl'; el.id='ctl-'+id;
-  el.innerHTML = `<div class="top"><label>${label}</label><span><input type="number" step="any"><span class="unit">${unit}</span></span></div><input type="range" min="${min}" max="${max}" step="${step}">`;
+  // curve>1: slider travel is non-linear (finer at the low end); the number field stays linear.
+  const N=1000, toPos=v=>N*Math.pow(Math.min(1,Math.max(0,(v-min)/(max-min))),1/curve), fromPos=s=>min+(max-min)*Math.pow(s/N,curve);
+  el.innerHTML = curve===1
+    ? `<div class="top"><label>${label}</label><span><input type="number" step="any"><span class="unit">${unit}</span></span></div><input type="range" min="${min}" max="${max}" step="${step}">`
+    : `<div class="top"><label>${label}</label><span><input type="number" step="any"><span class="unit">${unit}</span></span></div><input type="range" min="0" max="${N}" step="1">`;
   document.getElementById(host).appendChild(el);
   const num = el.querySelector('input[type=number]'), rng = el.querySelector('input[type=range]');
   const set = (v, silent) => {
     v = Math.min(hard[1], Math.max(hard[0], v)); val[id] = v;
-    rng.value = v; num.value = (+disp(v).toFixed(decimals));
+    rng.value = curve===1 ? v : toPos(v); num.value = (+disp(v).toFixed(decimals));
     el.classList.toggle('over', v>max || v<min);
     if(!silent) onParam(id);
   };
-  rng.addEventListener('input', () => set(+rng.value));
+  rng.addEventListener('input', () => set(curve===1 ? +rng.value : Math.round(fromPos(+rng.value)/step)*step));
   num.addEventListener('change', () => { const x=parseFloat(num.value); if(isFinite(x)) set(undisp(x)); else set(val[id]); });
   el.querySelector('label').addEventListener('dblclick', () => set(def));
   ctl[id] = { set, def }; set(def, true);
 }
 const pct = {disp:v=>v*100, undisp:v=>v/100, unit:'%', decimals:0};
 
-control('g-main',{id:'amount', label:'Amount', min:-40, max:40, step:0.1, def:8, unit:'px'});
+control('g-main',{id:'amount', label:'Amount', min:0, max:400, step:0.1, def:8, unit:'px', hard:[0,Infinity], curve:2});
+{ const inv=document.createElement('label'); inv.className='check'; inv.title='Swap which end of the spectrum lands on the outside (red outside ↔ blue outside)';
+  inv.innerHTML='<input type="checkbox" id="invert"> Invert'; document.getElementById('ctl-amount').after(inv); }
 control('g-main',{id:'blur', label:'Fringe blur', min:0, max:30, step:0.1, def:3, unit:'px', hard:[0,Infinity]});
 control('g-main',{id:'preserve', label:'Preserve detail (luma)', min:0, max:1, step:0.01, def:0, hard:[0,1], ...pct});
 control('g-main',{id:'streak', label:'Blur shape: round → streak', min:0, max:1, step:0.01, def:0, hard:[0,1], ...pct});
 control('g-main',{id:'clean', label:'Clean center', min:0, max:1, step:0.01, def:0.3, hard:[0,1.5], ...pct});
 control('g-main',{id:'glow', label:'Highlight glow', min:0, max:0.95, step:0.01, def:0.6, hard:[0,0.98], ...pct});
 control('g-main',{id:'mix', label:'Mix', min:0, max:1, step:0.01, def:1, hard:[0,2], ...pct});
+control('g-render',{id:'samples', label:'Samples', min:1, max:128, step:1, def:32, hard:[1,1e5], decimals:0});
 control('g-hue',{id:'hue', label:'Hue shift', min:-180, max:180, step:1, def:0, unit:'°', decimals:0});
 control('g-color',{id:'sat', label:'Color intensity', min:0, max:2, step:0.01, def:1, hard:[0,Infinity], ...pct});
 control('g-range',{id:'near', label:'Near', min:0.1, max:20, step:0.1, def:1, unit:'m', hard:[0.01,1e4]});
@@ -226,6 +236,7 @@ function applyLook(k){
   const l=LOOKS[k]; if(!l) return; applyingLook=true;
   gsel.value=l.glass;
   for(const p of ['amount','blur','preserve','streak','clean','glow','sat','secondary','hue']) ctl[p].set(l[p] ?? ctl[p].def, true);
+  document.getElementById('invert').checked=!!l.invert;
   if(l.colA){ document.getElementById('colA').value=l.colA; document.getElementById('colB').value=l.colB; }
   setPalette(l.palette); buildLUT(); applyingLook=false; markDirty();
 }
@@ -429,9 +440,11 @@ const del=o=>{ if(!o) return; if(o instanceof WebGLTexture) gl.deleteTexture(o);
 
 const S={W:1,H:1,hdr:false,colorTex:null,depthTex:null,depthFbo:null,depthMode:0,depthKind:null,depthW:0,depthH:0,
          accum:null,accumFbo:null,tile:null,tileFbo:null,center:[0.5,0.5],compare:'after',split:0.5,view:0,palette:0,frame:0,dirty:true,running:false};
+const FLOAT_BLEND=!!gl.getExtension('EXT_float_blend');
 const dummyDepth=tex(1,1,gl.R32F,gl.RED,gl.FLOAT,gl.NEAREST,new Float32Array([1]));
 function allocTargets(){ [S.accum,S.accumFbo,S.tile,S.tileFbo].forEach(del);
-  S.accum=tex(S.W,S.H,gl.RGBA16F,gl.RGBA,gl.HALF_FLOAT,gl.NEAREST); S.accumFbo=fbo(S.accum);
+  // 32-bit accumulation when float blending exists: a half-float running mean stalls after a few hundred samples.
+  S.accum=FLOAT_BLEND ? tex(S.W,S.H,gl.RGBA32F,gl.RGBA,gl.FLOAT,gl.NEAREST) : tex(S.W,S.H,gl.RGBA16F,gl.RGBA,gl.HALF_FLOAT,gl.NEAREST); S.accumFbo=fbo(S.accum);
   S.tile=tex(Math.ceil(S.W/32),Math.ceil(S.H/32),gl.RGBA16F,gl.RGBA,gl.HALF_FLOAT,gl.NEAREST); S.tileFbo=fbo(S.tile);
   cv.width=S.W; cv.height=S.H; applyZoom(); }
 function clearDepth(){ del(S.depthTex); del(S.depthFbo); S.depthTex=S.depthFbo=null; S.depthMode=0; S.depthKind=null; S.depthSrc=null; updateDepthUI(); }
@@ -507,7 +520,7 @@ function setFloatDepth(e){ del(S.depthTex); del(S.depthFbo);
   S.depthMode=2; S.depthKind='float'; S.depthSrc='exr'; S.depthW=e.w; S.depthH=e.h; updateDepthUI();
   // Focus where the render's camera focused (Redshift metadata); else on whatever is at the image centre.
   const f=Number.isFinite(e.focus)&&e.focus>0 ? e.focus : readDepth(0.5,0.5);
-  if(f) ctl.focus.set(Math.max(0,Math.min(1000,sliderFromFocus(Math.min(f,200)))), true);
+  if(f) ctl.focus.set(Math.max(0,sliderFromFocus(f)), true);   // may go past the slider (scene units, e.g. C4D cm)
   markDirty(); }
 function busy(msg){ document.getElementById('status').textContent=msg; }
 // Colour: EXR → float HDR path, anything else → browser image decoder (8-bit).
@@ -535,39 +548,62 @@ function updateDepthUI(){
 }
 
 // ---------- render loop ----------
-const QUALITY={draft:[16,8],good:[48,32],final:[128,64]};
+const SPP=64;                                            // rays per pixel per sample (= per pass)
+const QUALITY={draft:2,good:24,final:128};               // legacy names from compare.html → samples
 const hex2lin=h=>[1,3,5].map(i=>{ const c=parseInt(h.substr(i,2),16)/255; return c<=0.04045?c/12.92:Math.pow((c+0.055)/1.055,2.4); });
 function setCommon(p){ i1(p,'uDepth',1); f2(p,'uSize',S.W,S.H); i1(p,'uDepthMode',S.depthMode); i1(p,'uDepthInvert',document.getElementById('depthInvert').checked?1:0);
   f1(p,'uNear',val.near); f1(p,'uFar',val.far); f1(p,'uFocusDist',focusFromSlider(val.focus)); f1(p,'uAperture',val.bokeh); f1(p,'uMaxCoC',val.maxBlur); }
 function bindTex(u,t){ gl.activeTexture(gl.TEXTURE0+u); gl.bindTexture(gl.TEXTURE_2D,t); }
-function frame(){
-  if(S.dirty){ S.dirty=false; S.frame=0;
+// Render loop. A frame = `samples` passes accumulated into S.accum; the canvas is only updated once all of
+// them are done (like a final render), so the status line's time is the real cost of the frame.
+// Passes go out in batches with a fence each; two batches stay queued so the GPU never waits on JS.
+const R={fences:[], k:1, t0:0, lastSig:0, shown:true, ms:0, mc:new MessageChannel(), queued:false};
+R.mc.port1.onmessage=()=>{ R.queued=false; pump(); };
+const soon=()=>{ if(!R.queued){ R.queued=true; R.mc.port2.postMessage(0); } };
+const later=()=>setTimeout(pump,1);
+function renderMode(){ return S.compare==='before'?0:(document.getElementById('cheap').checked?1:2); }
+function totalSamples(mode){ return (mode===2&&S.view===0)?Math.max(1,Math.round(val.samples)):1; }
+function setStatus(t){ document.getElementById('status').textContent=`${S.W}×${S.H} · ${S.hdr?'HDR':'8-bit'} · ${t}`; }
+function pump(){
+  // retire finished batches; adapt batch size so one batch is ~30 ms of GPU work
+  while(R.fences.length && gl.clientWaitSync(R.fences[0].s,0,0)!==gl.TIMEOUT_EXPIRED){
+    const f=R.fences.shift(); gl.deleteSync(f.s); const now=performance.now(), dt=now-Math.max(R.lastSig,f.t); R.lastSig=now;
+    R.k=Math.max(1,Math.min(512,Math.round(f.n*Math.min(2,Math.max(0.25,30/Math.max(dt,1)))))); }
+  if(S.dirty && !R.fences.length){ S.dirty=false; S.frame=0; R.shown=false; R.t0=performance.now(); R.lastSig=R.t0;
     gl.bindFramebuffer(gl.FRAMEBUFFER,S.tileFbo); gl.viewport(0,0,Math.ceil(S.W/32),Math.ceil(S.H/32));
     gl.useProgram(P.tile); bindTex(1,S.depthTex||dummyDepth); setCommon(P.tile); gl.drawArrays(gl.TRIANGLES,0,3); }
-  const [spp,frames]=QUALITY[document.getElementById('quality').value];
-  const cheap=document.getElementById('cheap').checked, mode = S.compare==='before'?0:(cheap?1:2);
-  const maxF=(mode===2&&S.view===0)?frames:1;
-  if(S.frame<maxF){
+  if(!S.dirty){
+    const mode=renderMode(), total=totalSamples(mode);
+    while(S.frame<total && R.fences.length<2){ const n=Math.min(R.k,total-S.frame); passes(mode,n);
+      R.fences.push({s:gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE,0), n, t:performance.now()}); gl.flush(); }
+    if(R.fences.length){ setStatus(`rendering ${S.frame-R.fences.reduce((a,f)=>a+f.n,0)}/${total} samples…`); later(); return; }
+    if(!R.shown){ present(); R.shown=true; R.ms=performance.now()-R.t0;
+      setStatus(total>1?`${total} samples · ${(R.ms/1000).toFixed(2)} s (${(R.ms/total).toFixed(1)} ms/sample)`:`${(R.ms).toFixed(0)} ms`); }
+  }
+  if(S.dirty) later(); else S.running=false;
+}
+function present(){
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,S.W,S.H);
+  const d=P.disp; gl.useProgram(d); bindTex(0,S.accum); i1(d,'uAccum',0); f2(d,'uSize',S.W,S.H); i1(d,'uHDR',S.hdr?1:0); i1(d,'uRaw',S.view?1:0);
+  f1(d,'uSplit',(S.compare==='split'&&!S.view)?S.split:0); gl.drawArrays(gl.TRIANGLES,0,3); }
+function passes(mode,n){
+  {
     gl.bindFramebuffer(gl.FRAMEBUFFER,S.accumFbo); gl.viewport(0,0,S.W,S.H);
     const p=P.main; gl.useProgram(p); bindTex(0,S.colorTex); bindTex(1,S.depthTex||dummyDepth); bindTex(2,S.tile);
     setCommon(p); i1(p,'uTex',0); i1(p,'uTile',2); f2(p,'uCenter',...S.center);
-    f1(p,'uLateral',val.amount); f1(p,'uFalloff',Math.max(0.2,0.6+3.4*val.clean+val.falloffBase)); f1(p,'uAxial',val.blur); f1(p,'uAxSpan',axSpan);
+    f1(p,'uLateral',document.getElementById('invert').checked?-val.amount:val.amount); f1(p,'uFalloff',Math.max(0.2,0.6+3.4*val.clean+val.falloffBase)); f1(p,'uAxial',val.blur); f1(p,'uAxSpan',axSpan);
     f1(p,'uFocusLambda',val.focusLambda); f1(p,'uHighlight',val.glow); f1(p,'uSplit',S.compare==='split'?S.split:0); f1(p,'uMix',val.mix); f1(p,'uPreserve',val.preserve);
     f1(p,'uCatEye',val.catEye); f1(p,'uStreak',val.streak); f1(p,'uSphero',val.rim); f1(p,'uSpheroChroma',val.sphChroma);
     f1(p,'uBlades',val.blades); f1(p,'uBladeRot',val.bladeRot*Math.PI/180); f1(p,'uHue',val.hue*Math.PI/180); f1(p,'uSat',val.sat);
     f3(p,'uColA',hex2lin(document.getElementById('colA').value)); f3(p,'uColB',hex2lin(document.getElementById('colB').value));
-    i1(p,'uSamples',spp); i1(p,'uMode',mode); i1(p,'uFrame',S.frame); i1(p,'uView',S.view); i1(p,'uColorMode',S.palette);
+    i1(p,'uSamples',SPP); i1(p,'uMode',mode); i1(p,'uView',S.view); i1(p,'uColorMode',S.palette);
     i1(p,'uTileR',Math.min(8,Math.ceil(val.maxBlur/32))); i1(p,'uHDR',S.hdr?1:0); gl.uniform1fv(L(p,'uDisp'),LUT);
-    gl.enable(gl.BLEND); gl.blendFunc(gl.CONSTANT_ALPHA,gl.ONE_MINUS_CONSTANT_ALPHA); gl.blendColor(0,0,0,1/(S.frame+1));
-    gl.drawArrays(gl.TRIANGLES,0,3); gl.disable(gl.BLEND); S.frame++;
-    gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,S.W,S.H);
-    const d=P.disp; gl.useProgram(d); bindTex(0,S.accum); i1(d,'uAccum',0); f2(d,'uSize',S.W,S.H); i1(d,'uHDR',S.hdr?1:0); i1(d,'uRaw',S.view?1:0);
-    f1(d,'uSplit',(S.compare==='split'&&!S.view)?S.split:0); gl.drawArrays(gl.TRIANGLES,0,3);
-    document.getElementById('status').textContent=`${S.W}×${S.H} · ${S.hdr?'HDR':'8-bit'} · ${S.frame<maxF?'refining '+S.frame+'/'+maxF:'done'}`;
+    gl.enable(gl.BLEND); gl.blendFunc(gl.CONSTANT_ALPHA,gl.ONE_MINUS_CONSTANT_ALPHA);
+    for(let i=0;i<n;i++){ i1(p,'uFrame',S.frame); gl.blendColor(0,0,0,1/(S.frame+1)); gl.drawArrays(gl.TRIANGLES,0,3); S.frame++; }
+    gl.disable(gl.BLEND);
   }
-  if(S.dirty||S.frame<maxF) requestAnimationFrame(frame); else S.running=false;
 }
-function markDirty(){ S.dirty=true; if(!S.running){ S.running=true; requestAnimationFrame(frame); } }
+function markDirty(){ S.dirty=true; if(!S.running){ S.running=true; soon(); } }
 function onParam(id){
   if(id==='secondary'||id==='focusLambda') buildLUT();
   if(!applyingLook && ['amount','blur','preserve','streak','clean','glow','sat','hue','secondary'].includes(id)) lsel.value='custom';
@@ -597,7 +633,8 @@ seg('compare',v=>S.compare=v); seg('viewmode',v=>S.view=+v); seg('palette',v=>{ 
 function setPalette(v){ S.palette=v; document.querySelectorAll('#palette button').forEach(b=>b.classList.toggle('on',+b.dataset.v===v));
   document.getElementById('g-hue').classList.toggle('hidden',v!==1); document.getElementById('twocolor').classList.toggle('hidden',v!==2); }
 ['colA','colB'].forEach(id=>document.getElementById(id).oninput=()=>{ lsel.value='custom'; markDirty(); });
-['depthInvert','cheap','quality'].forEach(id=>document.getElementById(id).onchange=markDirty);
+['depthInvert','cheap'].forEach(id=>document.getElementById(id).onchange=markDirty);
+document.getElementById('invert').onchange=()=>{ if(!applyingLook) lsel.value='custom'; markDirty(); };
 lsel.onchange=()=>applyLook(lsel.value);
 gsel.onchange=()=>{ buildLUT(); lsel.value='custom'; markDirty(); };
 document.getElementById('resetCenter').onclick=e=>{ e.preventDefault(); S.center=[0.5,0.5]; markDirty(); };
@@ -642,7 +679,7 @@ cv.addEventListener('pointerdown',e=>{ const [u,v]=uv(e);
     e.preventDefault(); pan={x:e.clientX,y:e.clientY,sl:viewEl.scrollLeft,st:viewEl.scrollTop}; cv.style.cursor='grabbing'; cv.setPointerCapture(e.pointerId); }
   else if(e.button!==0) return;
   else if(e.shiftKey){ S.center=[u,v]; markDirty(); }
-  else if(e.altKey){ const z=readDepth(u,v); if(z!=null){ ctl.focus.set(Math.max(0,Math.min(1000,sliderFromFocus(Math.min(z,200))))); } }
+  else if(e.altKey){ const z=readDepth(u,v); if(z!=null){ ctl.focus.set(Math.max(0,sliderFromFocus(Math.min(z,1e5)))); } }
   else if(S.compare==='split'){ dragging=true; S.split=u; markDirty(); cv.setPointerCapture(e.pointerId); } });
 cv.addEventListener('pointermove',e=>{
   if(pan){ viewEl.scrollLeft=pan.sl-(e.clientX-pan.x); viewEl.scrollTop=pan.st-(e.clientY-pan.y); }
@@ -654,7 +691,13 @@ cv.addEventListener('dblclick',e=>{ if(e.shiftKey||e.altKey) return; const [u,v]
 const srcSel=document.getElementById('source'); let lastSrc='scene';
 srcSel.onchange=()=>{ const v=srcSel.value; if(v==='open'){ srcSel.value=lastSrc; document.getElementById('file').click(); return; }
   if(v==='shared'){ srcSel.value=lastSrc; return; }
-  lastSrc=v; if(v==='scene') setSceneSource(); else setImageSource(v==='test'?testPattern():branches()); };
+  lastSrc=v; try{ localStorage.setItem('ca-gl-source',v); }catch{}
+  if(v==='scene') setSceneSource(); else if(v==='ztest') loadZtest(); else setImageSource(v==='test'?testPattern():branches()); };
+// Built-in test render: C4D/Redshift beauty + float Z depth (served next to this page under assets/).
+async function loadZtest(){ busy('Loading Ztest render…');
+  try{ const [b,d]=await Promise.all(['assets/ztest_beauty.exr','assets/ztest_depth.exr'].map(async u=>{ const r=await fetch(u); if(!r.ok) throw Error(`${u}: HTTP ${r.status}`); return r.blob(); }));
+    setHDRImage(await decodeEXR(b)); await loadDepth(d); }
+  catch(err){ console.error(err); busy(''); alert('Could not load the Ztest render: '+err.message); } }
 function loadImg(f,cb){ if(!f) return; const img=new Image(); img.onload=()=>cb(img); img.src=URL.createObjectURL(f); }
 document.getElementById('file').onchange=e=>{ loadColor(e.target.files[0]); e.target.value=''; };
 document.getElementById('loadDepth').onclick=()=>document.getElementById('depthFile').click();
@@ -666,15 +709,21 @@ addEventListener('dragover',e=>{ e.preventDefault(); drop.style.display='flex'; 
 addEventListener('dragleave',e=>{ if(e.target===drop) drop.style.display='none'; });
 addEventListener('drop',e=>{ e.preventDefault(); drop.style.display='none'; loadColor(e.dataTransfer.files[0]); });
 
-setPalette(0); applyLook('vintage'); setSceneSource();
+setPalette(0); applyLook('vintage');
+{ let s='scene'; try{ s=localStorage.getItem('ca-gl-source')||s; }catch{}
+  if(parent!==window || ![...srcSel.options].some(o=>o.value===s&&!['open','shared'].includes(s))) s='scene';
+  srcSel.value=lastSrc=s; if(s==='scene') setSceneSource(); else if(s==='ztest'){ setSceneSource(); loadZtest(); } else setImageSource(s==='test'?testPattern():branches()); }
 
 // ---------- bridge for compare.html (same-origin parent pushes image / settings) ----------
 function applySettings(v){
   applyingLook=true;
-  for(const k of Object.keys(ctl)) if(typeof v[k]==='number' && isFinite(v[k])) ctl[k].set(v[k], true);
+  if(v.quality in QUALITY && !('samples' in v)) ctl.samples.set(QUALITY[v.quality], true);
+  for(const k of Object.keys(ctl)) if(typeof v[k]==='number' && isFinite(v[k])) ctl[k].set(k==='amount'?Math.abs(v[k]):v[k], true);
+  // negative amount (older callers) = inverted
+  if(typeof v.invert==='boolean') document.getElementById('invert').checked=v.invert;
+  else if(typeof v.amount==='number') document.getElementById('invert').checked=v.amount<0;
   if(v.glass in GLASSES) gsel.value=v.glass;
   if(Number.isInteger(v.palette)) setPalette(v.palette);
-  if(v.quality in QUALITY) document.getElementById('quality').value=v.quality;
   if(Array.isArray(v.center)) S.center=v.center.slice(0,2).map(Number);
   if(typeof v.cheap==='boolean') document.getElementById('cheap').checked=v.cheap;
   buildLUT(); lsel.value='custom'; applyingLook=false; markDirty();
