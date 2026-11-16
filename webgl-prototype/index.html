@@ -138,10 +138,10 @@ control('g-main',{id:'amount', label:'Amount', min:0, max:400, step:0.1, def:8, 
 { const inv=document.createElement('label'); inv.className='check'; inv.title='Swap which end of the spectrum lands on the outside (red outside ↔ blue outside)';
   inv.innerHTML='<input type="checkbox" id="invert"> Invert'; document.getElementById('ctl-amount').after(inv); }
 control('g-main',{id:'blur', label:'Fringe blur', min:0, max:30, step:0.1, def:3, unit:'px', hard:[0,Infinity]});
-control('g-main',{id:'preserve', label:'Preserve detail (luma)', min:0, max:1, step:0.01, def:0, hard:[0,1], ...pct});
-control('g-main',{id:'streak', label:'Blur shape: round → streak', min:0, max:1, step:0.01, def:0, hard:[0,1], ...pct});
+control('g-main',{id:'streak', label:'Fringe blur shape: round → streak', min:0, max:1, step:0.01, def:0, hard:[0,1], ...pct});
 control('g-main',{id:'clean', label:'Clean center', min:0, max:1, step:0.01, def:0.3, hard:[0,1.5], ...pct});
 control('g-main',{id:'glow', label:'Highlight glow', min:0, max:0.95, step:0.01, def:0.6, hard:[0,0.98], ...pct});
+control('g-main',{id:'preserve', label:'Preserve detail (luma)', min:0, max:1, step:0.01, def:0, hard:[0,1], ...pct});
 control('g-main',{id:'mix', label:'Mix', min:0, max:1, step:0.01, def:1, hard:[0,2], ...pct});
 control('g-render',{id:'samples', label:'Samples', min:1, max:128, step:1, def:32, hard:[1,1e5], decimals:0});
 control('g-render',{id:'blurK', label:'Blur samples (× Samples)', min:1, max:16, step:1, def:4, unit:'×', hard:[1,64], decimals:0});
