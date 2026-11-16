@@ -74,7 +74,7 @@
 
   <div class="sec">Render</div>
   <div id="g-render"></div>
-  <div class="hint">Each sample is one full pass (64 spectral + lens rays per pixel). The image only updates when every sample is done, and the status line shows how long the frame took.</div>
+  <div class="hint">Each sample is one full pass (64 wavelengths per pixel). Blur samples multiplies the bokeh/fringe-blur rays per wavelength; it costs nothing when there is no blur, and cleans blur faster than raising Samples. The image only updates when every sample is done, and the status line shows how long the frame took.</div>
 
   <div class="sec">Fringe colors</div>
   <div class="seg full" id="palette"><button data-v="0" class="on">Natural</button><button data-v="1">Shifted</button><button data-v="2">Two-color</button></div>
@@ -143,6 +143,7 @@ control('g-main',{id:'clean', label:'Clean center', min:0, max:1, step:0.01, def
 control('g-main',{id:'glow', label:'Highlight glow', min:0, max:0.95, step:0.01, def:0.6, hard:[0,0.98], ...pct});
 control('g-main',{id:'mix', label:'Mix', min:0, max:1, step:0.01, def:1, hard:[0,2], ...pct});
 control('g-render',{id:'samples', label:'Samples', min:1, max:128, step:1, def:32, hard:[1,1e5], decimals:0});
+control('g-render',{id:'blurK', label:'Blur samples (× Samples)', min:1, max:16, step:1, def:4, unit:'×', hard:[1,64], decimals:0});
 control('g-hue',{id:'hue', label:'Hue shift', min:-180, max:180, step:1, def:0, unit:'°', decimals:0});
 control('g-color',{id:'sat', label:'Color intensity', min:0, max:2, step:0.01, def:1, hard:[0,Infinity], ...pct});
 control('g-range',{id:'near', label:'Near', min:0.1, max:20, step:0.1, def:1, unit:'m', hard:[0.01,1e4]});
@@ -318,10 +319,10 @@ uniform vec2 uCenter;
 uniform float uLateral, uFalloff, uAxial, uAxSpan, uFocusLambda, uHighlight, uSplit, uMix, uPreserve;
 uniform float uCatEye, uStreak, uSphero, uSpheroChroma, uBlades, uBladeRot, uHue, uSat;
 uniform vec3 uColA, uColB;
-uniform int uSamples, uMode, uFrame, uView, uColorMode, uTileR;
+uniform int uSamples, uMode, uFrame, uView, uColorMode, uTileR, uBlurK;
 uniform bool uHDR;
 uniform float uDisp[64];
-out vec4 o;
+layout(location=0) out vec4 o; layout(location=1) out vec4 oW;
 uint pcg(uint v){ uint s=v*747796405u+2891336453u; uint w=((s>>((s>>28u)+4u))^s)*277803737u; return (w>>22u)^w; }
 float u01(uint v){ return float(v)*(1.0/4294967296.0); }
 float radinv(uint b){ b=(b<<16u)|(b>>16u); b=((b&0x55555555u)<<1u)|((b&0xAAAAAAAAu)>>1u); b=((b&0x33333333u)<<2u)|((b&0xCCCCCCCCu)>>2u);
@@ -350,6 +351,7 @@ vec3 fetch(vec2 p){ return expandHL(texture(uTex,p/uSize).rgb); }
 void main(){
   vec2 px=gl_FragCoord.xy;
   vec3 orig=texture(uTex,px/uSize).rgb;
+  oW=vec4(1,1,1,0);                                      // a=0: o is final colour; a=1: o/oW resolved in the display pass
   if(uView==1){ float c=cocOf(depthAt(px))/max(uMaxCoC,1.0); vec3 l=vec3(dot(orig,vec3(.2126,.7152,.0722)));
     o=vec4(0.15*l/(1.0+l)+(c<0.0?vec3(1.0,0.45,0.1)*(-c):vec3(0.15,0.45,1.0)*c),1); return; }
   if(uView==2){ float v=log(depthAt(px)/0.2)/log(1000.0); o=vec4(vec3(1.0-clamp(v,0.0,1.0)),1); return; }
@@ -386,37 +388,52 @@ void main(){
       float a0=max(abs(cc),0.5), wc=1.0/max(a0*a0,1.0);
       if(abs(cc)>1.0) wc*=max(0.0,1.0-(uSphero*sign(cc)+uSpheroChroma*d));
       acc+=wl*wc*fetch(base); wsum+=wl*wc;
-      float rho=R*sqrt(fract(radinv(uint(i))+jr));
-      if(rho<1.0) continue;
-      float a=float(i)*2.3999632+rot;
-      vec2 offP=rho*vec2(cos(a),sin(a));
-      float bound=1.0;
-      if(uBlades>=3.0){ float seg=6.2831853/uBlades, th=mod(a-uBladeRot,seg)-0.5*seg; bound=cos(0.5*seg)/cos(th); }
-      float rhoE=rho/bound;
-      vec2 sp=base+dir*dot(offP,dir)*sqR+tng*dot(offP,tng)*sqT;
-      float zs=depthAt(sp), cs=cocOf(zs)+dz, ac=abs(cs);
-      if(zs>zc) ac=min(ac,abs(cc));
-      ac=max(ac,0.5);
-      float cov=clamp(ac-rhoE+0.5,0.0,1.0); if(cov<=0.0) continue;
-      float q=min(rhoE/ac,1.0), s=uSphero*sign(cs)+uSpheroChroma*d;
-      float w=cov*max(0.0,1.0+s*(2.0*q*q-1.0))*R*R/(ac*ac);
-      acc+=wl*w*fetch(sp); wsum+=wl*w;
+      // Gather radius for THIS wavelength: no neighbour's blur can exceed tile max + this wavelength's axial
+      // offset, so sampling the global R wasted most samples on wavelengths whose own blur is small (noise).
+      float Ri=min(R, tmax+abs(dz)+1.0);
+      if(Ri<=1.0) continue;
+      float invK=1.0/float(uBlurK);
+      for(int j=0;j<64;j++){ if(j>=uBlurK) break;
+        uint k=uint(i*uBlurK+j);
+        float rho=Ri*sqrt(fract(radinv(k)+jr));
+        if(rho<1.0) continue;
+        float a=float(k)*2.3999632+rot;
+        vec2 offP=rho*vec2(cos(a),sin(a));
+        float bound=1.0;
+        if(uBlades>=3.0){ float seg=6.2831853/uBlades, th=mod(a-uBladeRot,seg)-0.5*seg; bound=cos(0.5*seg)/cos(th); }
+        float rhoE=rho/bound;
+        vec2 sp=base+dir*dot(offP,dir)*sqR+tng*dot(offP,tng)*sqT;
+        float zs=depthAt(sp), cs=cocOf(zs)+dz, ac=abs(cs);
+        if(zs>zc) ac=min(ac,abs(cc));
+        ac=max(ac,0.5);
+        float cov=clamp(ac-rhoE+0.5,0.0,1.0); if(cov<=0.0) continue;
+        float q=min(rhoE/ac,1.0), s=uSphero*sign(cs)+uSpheroChroma*d;
+        float w=cov*max(0.0,1.0+s*(2.0*q*q-1.0))*Ri*Ri/(ac*ac)*invK;
+        acc+=wl*w*fetch(sp); wsum+=wl*w;
+      }
     }
-    col=acc/max(wsum,vec3(1e-6));
+    // Write the weighted sum and the weight sum separately; the passes average both and the display pass divides
+    // once. (Averaging per-pass acc/wsum ratios is biased and never converges with more Samples.)
+    float sc=1.0/(float(uSamples)*(1.0+R*R));           // per-pixel constant, keeps values in range
+    o=vec4(acc*sc,1); oW=vec4(wsum*sc,1); return;
   }
-  vec3 oE=expandHL(orig); const vec3 LW=vec3(0.2126,0.7152,0.0722);
-  col=max(col+vec3(dot(oE,LW)-dot(col,LW))*uPreserve,0.0);   // keep the original's luminance detail, effect only in chroma
-  col=mix(oE,col,uMix);
-  o=vec4(compressHL(max(col,0.0)),1);
+  o=vec4(col,1); oW=vec4(1);
 }`;
 
 const FS_DISP=`#version 300 es
 precision highp float;
-uniform sampler2D uAccum; uniform vec2 uSize; uniform bool uHDR,uRaw; uniform float uSplit;
+uniform sampler2D uAccum, uWsum, uTex; uniform vec2 uSize; uniform bool uHDR,uRaw; uniform float uSplit, uHighlight, uPreserve, uMix;
 out vec4 o;
 vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
 vec3 toSRGB(vec3 c){ c=clamp(c,0.0,1.0); return mix(c*12.92,1.055*pow(c,vec3(1.0/2.4))-0.055,step(0.0031308,c)); }
+vec3 expandHL(vec3 c){ if(uHDR||uHighlight<=0.0) return c; c=min(c,vec3(0.999)); return c/(1.0-c*uHighlight); }
+vec3 compressHL(vec3 c){ if(uHDR||uHighlight<=0.0) return c; return c/(1.0+c*uHighlight); }
 void main(){ ivec2 ip=ivec2(int(gl_FragCoord.x),int(uSize.y-gl_FragCoord.y)); vec3 c=texelFetch(uAccum,ip,0).rgb;
+  vec4 w=texelFetch(uWsum,ip,0);
+  if(w.a>0.5){                                           // resolve: sum / weight, then the per-pixel finishing steps
+    vec3 col=c/max(w.rgb,vec3(1e-30)), oE=expandHL(texelFetch(uTex,ip,0).rgb); const vec3 LW=vec3(0.2126,0.7152,0.0722);
+    col=max(col+vec3(dot(oE,LW)-dot(col,LW))*uPreserve,0.0);   // keep the original's luminance detail, effect only in chroma
+    c=compressHL(max(mix(oE,col,uMix),0.0)); }
   if(!uRaw) c=toSRGB(uHDR?aces(c):c);
   if(uSplit>0.0&&abs(float(ip.x)+0.5-uSplit*uSize.x)<1.5) c=vec3(1.0,0.8,0.2);
   o=vec4(c,1); }`;
@@ -442,9 +459,11 @@ const S={W:1,H:1,hdr:false,colorTex:null,depthTex:null,depthFbo:null,depthMode:0
          accum:null,accumFbo:null,tile:null,tileFbo:null,center:[0.5,0.5],compare:'after',split:0.5,view:0,palette:0,frame:0,dirty:true,running:false};
 const FLOAT_BLEND=!!gl.getExtension('EXT_float_blend');
 const dummyDepth=tex(1,1,gl.R32F,gl.RED,gl.FLOAT,gl.NEAREST,new Float32Array([1]));
-function allocTargets(){ [S.accum,S.accumFbo,S.tile,S.tileFbo].forEach(del);
+function allocTargets(){ [S.accum,S.accumW,S.accumFbo,S.tile,S.tileFbo].forEach(del);
   // 32-bit accumulation when float blending exists: a half-float running mean stalls after a few hundred samples.
-  S.accum=FLOAT_BLEND ? tex(S.W,S.H,gl.RGBA32F,gl.RGBA,gl.FLOAT,gl.NEAREST) : tex(S.W,S.H,gl.RGBA16F,gl.RGBA,gl.HALF_FLOAT,gl.NEAREST); S.accumFbo=fbo(S.accum);
+  // Two targets: weighted colour sum and weight sum (divided in the display pass).
+  const acc=()=>FLOAT_BLEND ? tex(S.W,S.H,gl.RGBA32F,gl.RGBA,gl.FLOAT,gl.NEAREST) : tex(S.W,S.H,gl.RGBA16F,gl.RGBA,gl.HALF_FLOAT,gl.NEAREST);
+  S.accum=acc(); S.accumW=acc(); S.accumFbo=fbo(S.accum,S.accumW); gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1]);
   S.tile=tex(Math.ceil(S.W/32),Math.ceil(S.H/32),gl.RGBA16F,gl.RGBA,gl.HALF_FLOAT,gl.NEAREST); S.tileFbo=fbo(S.tile);
   cv.width=S.W; cv.height=S.H; applyZoom(); }
 function clearDepth(){ del(S.depthTex); del(S.depthFbo); S.depthTex=S.depthFbo=null; S.depthMode=0; S.depthKind=null; S.depthSrc=null; updateDepthUI(); }
@@ -584,7 +603,8 @@ function pump(){
 }
 function present(){
   gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,S.W,S.H);
-  const d=P.disp; gl.useProgram(d); bindTex(0,S.accum); i1(d,'uAccum',0); f2(d,'uSize',S.W,S.H); i1(d,'uHDR',S.hdr?1:0); i1(d,'uRaw',S.view?1:0);
+  const d=P.disp; gl.useProgram(d); bindTex(0,S.accum); bindTex(1,S.accumW); bindTex(2,S.colorTex); i1(d,'uAccum',0); i1(d,'uWsum',1); i1(d,'uTex',2);
+  f1(d,'uHighlight',val.glow); f1(d,'uPreserve',val.preserve); f1(d,'uMix',val.mix); f2(d,'uSize',S.W,S.H); i1(d,'uHDR',S.hdr?1:0); i1(d,'uRaw',S.view?1:0);
   f1(d,'uSplit',(S.compare==='split'&&!S.view)?S.split:0); gl.drawArrays(gl.TRIANGLES,0,3); }
 function passes(mode,n){
   {
@@ -596,7 +616,7 @@ function passes(mode,n){
     f1(p,'uCatEye',val.catEye); f1(p,'uStreak',val.streak); f1(p,'uSphero',val.rim); f1(p,'uSpheroChroma',val.sphChroma);
     f1(p,'uBlades',val.blades); f1(p,'uBladeRot',val.bladeRot*Math.PI/180); f1(p,'uHue',val.hue*Math.PI/180); f1(p,'uSat',val.sat);
     f3(p,'uColA',hex2lin(document.getElementById('colA').value)); f3(p,'uColB',hex2lin(document.getElementById('colB').value));
-    i1(p,'uSamples',SPP); i1(p,'uMode',mode); i1(p,'uView',S.view); i1(p,'uColorMode',S.palette);
+    i1(p,'uSamples',SPP); i1(p,'uBlurK',Math.max(1,Math.min(64,Math.round(val.blurK)))); i1(p,'uMode',mode); i1(p,'uView',S.view); i1(p,'uColorMode',S.palette);
     i1(p,'uTileR',Math.min(8,Math.ceil(val.maxBlur/32))); i1(p,'uHDR',S.hdr?1:0); gl.uniform1fv(L(p,'uDisp'),LUT);
     gl.enable(gl.BLEND); gl.blendFunc(gl.CONSTANT_ALPHA,gl.ONE_MINUS_CONSTANT_ALPHA);
     for(let i=0;i<n;i++){ i1(p,'uFrame',S.frame); gl.blendColor(0,0,0,1/(S.frame+1)); gl.drawArrays(gl.TRIANGLES,0,3); S.frame++; }
