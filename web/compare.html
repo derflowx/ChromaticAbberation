@@ -37,7 +37,7 @@
     <div class="group">
       <button id="chart" title="Send the WebGPU test chart to both sides">Test chart → both</button>
       <button id="open" title="Or drop / paste an image anywhere on this bar">Load image → both…</button>
-      <input type="file" id="file" accept="image/*" hidden>
+      <input type="file" id="file" accept="image/*,.exr" hidden>
     </div>
     <label class="group" title="Lateral shift at the image corner (WebGPU units). The WebGL side gets the converted value.">
       Amount
@@ -97,14 +97,17 @@
       for (const app of ready) send(app, { type: 'ca-set', values: m[app] });
       updateStatus();
     }
+    // EXR can only be decoded by the WebGL2 prototype; the WebGPU side keeps its current image.
+    const accepts = (app) => !image.exr || app === 'webgl';
     function pushImage() {
       if (!image) return;
-      for (const app of ready) send(app, { type: 'ca-image', blob: image.blob, name: image.name });
+      for (const app of ready) if (accepts(app)) send(app, { type: 'ca-image', blob: image.blob, name: image.name });
       updateStatus();
     }
     function updateStatus() {
       if (ready.size < 2) { status.textContent = `Waiting for both sides… (${[...ready].join(', ') || 'none'} ready)`; return; }
-      status.textContent = `Synced: ${image ? image.name : 'no image'} · WebGPU ${amount} px ↔ WebGL ${(amount * GL_PER_GPU).toFixed(1)} px`;
+      const exrNote = image?.exr ? ' (EXR: WebGL2 only, the WebGPU version can’t read EXR)' : '';
+      status.textContent = `Synced: ${image ? image.name : 'no image'}${exrNote} · WebGPU ${amount} px ↔ WebGL ${(amount * GL_PER_GPU).toFixed(1)} px`;
     }
 
     function setAmount(v) {
@@ -118,9 +121,12 @@
     amtNum.addEventListener('change', () => setAmount(parseFloat(amtNum.value)));
     amt.addEventListener('dblclick', () => setAmount(DEFAULT_AMOUNT));
 
-    function useBlob(blob, name) {
-      if (!blob || !blob.type.startsWith('image/')) return;
-      image = { blob, name };
+    async function useBlob(blob, name) {
+      if (!blob) return;
+      const m = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+      const exr = m[0] === 0x76 && m[1] === 0x2f && m[2] === 0x31 && m[3] === 0x01;
+      if (!exr && !blob.type.startsWith('image/')) return;
+      image = { blob, name, exr };
       pushImage();
     }
     async function useChart() {
@@ -172,7 +178,7 @@
       const app = e.data.app;
       if (!(app in frames) || e.source !== frames[app].contentWindow) return;
       ready.add(app);
-      if (image) send(app, { type: 'ca-image', blob: image.blob, name: image.name });
+      if (image && accepts(app)) send(app, { type: 'ca-image', blob: image.blob, name: image.name });
       send(app, { type: 'ca-set', values: matched(amount)[app] });
       updateStatus();
     });

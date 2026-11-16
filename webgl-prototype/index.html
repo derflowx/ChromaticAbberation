@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Spectral Chromatic Aberration</title>
+<!-- three.js is only used for its EXR decoder (DWAA/DWAB, PIZ, ZIP, RLE, PXR24…), loaded lazily on the first EXR. -->
+<script type="importmap">{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }</script>
 <style>
   :root { --bg:#0e0f11; --panel:#17181c; --panel2:#1e2025; --fg:#e8e8ea; --dim:#8b8e97; --acc:#8fb0ff; --line:#2a2c33; }
   * { box-sizing: border-box; }
@@ -52,11 +57,11 @@
     <div class="seg" id="compare"><button data-v="before">Before</button><button data-v="after" class="on">After</button><button data-v="split">Split</button></div>
     <div class="seg" id="viewmode"><button data-v="0" class="on">Image</button><button data-v="1">Blur map</button><button data-v="2">Depth</button></div>
     <div class="sep"></div>
-    <select id="source"><option value="scene">3D scene (HDR + depth)</option><option value="test">Test pattern</option><option value="branches">Branches</option><option value="open">Open image…</option></select>
+    <select id="source"><option value="scene">3D scene (HDR + depth)</option><option value="test">Test pattern</option><option value="branches">Branches</option><option value="open">Open image / EXR…</option></select>
     <select id="zoom"><option value="fit">Fit</option><option value="1">100%</option><option value="2">200%</option><option value="4">400%</option></select>
     <select id="quality"><option value="draft">Draft</option><option value="good" selected>Good</option><option value="final">Final</option></select>
     <button class="btn" id="save">Save PNG</button>
-    <input type="file" id="file" accept="image/*" class="hidden">
+    <input type="file" id="file" accept="image/*,.exr" class="hidden">
   </div>
   <div id="view"><canvas id="c"></canvas><div id="status"></div><div id="drop">Drop image</div></div>
 </div>
@@ -78,7 +83,7 @@
     <summary>Depth &amp; bokeh</summary>
     <div class="hint" id="depthState"></div>
     <div class="row2"><button class="btn" id="loadDepth">Load depth map…</button><button class="btn" id="clearDepth">Remove</button></div>
-    <input type="file" id="depthFile" accept="image/*" class="hidden">
+    <input type="file" id="depthFile" accept="image/*,.exr" class="hidden">
     <div id="byteDepth" class="hidden">
       <label class="check"><input type="checkbox" id="depthInvert" checked> White = near</label>
       <div id="g-range"></div>
@@ -441,6 +446,41 @@ function setSceneSource(){ clearDepth(); del(S.colorTex); S.W=1920; S.H=1080; S.
 function setDepthImage(img){ del(S.depthTex); del(S.depthFbo);
   S.depthTex=tex(0,0,gl.RGBA8,gl.RGBA,gl.UNSIGNED_BYTE,gl.NEAREST,img); S.depthFbo=fbo(S.depthTex);
   S.depthMode=1; S.depthKind='byte'; S.depthW=img.naturalWidth||img.width; S.depthH=img.naturalHeight||img.height; updateDepthUI(); markDirty(); }
+// ---------- EXR (float HDR colour, or float depth) ----------
+async function isEXR(blob){ const b=new Uint8Array(await blob.slice(0,4).arrayBuffer()); return b[0]===0x76&&b[1]===0x2f&&b[2]===0x31&&b[3]===0x01; }
+let exrMods=null;
+async function decodeEXR(blob){
+  exrMods ??= Promise.all([import('three'), import('three/addons/loaders/EXRLoader.js')]);
+  const [THREE,{EXRLoader}]=await exrMods, ld=new EXRLoader(); ld.setDataType(THREE.FloatType);
+  const r=ld.parse(await blob.arrayBuffer()), w=r.width, h=r.height, ch=r.data.length/(w*h), row=w*ch;
+  const data=new Float32Array(r.data.length); // EXRLoader writes bottom-up; this app keeps row 0 = top
+  for(let y=0;y<h;y++) data.set(r.data.subarray((h-1-y)*row,(h-y)*row), y*row);
+  return {w,h,ch,data};
+}
+function setHDRImage(e){ clearDepth(); del(S.colorTex); S.W=e.w; S.H=e.h; S.hdr=true;
+  let d=e.data; if(e.ch===1){ d=new Float32Array(e.w*e.h*4); for(let i=0;i<e.w*e.h;i++){ d[i*4]=d[i*4+1]=d[i*4+2]=e.data[i]; d[i*4+3]=1; } }
+  // NaN → 0, and clamp to the half-float range (the texture is RGBA16F; > 65504 would become Inf
+  // and poison the accumulation, e.g. the sun in an HDRI).
+  for(let i=0;i<d.length;i++){ const v=d[i]; d[i]=Number.isNaN(v)?0:Math.min(65504,Math.max(-65504,v)); }
+  S.colorTex=tex(e.w,e.h,gl.RGBA16F,gl.RGBA,gl.FLOAT,gl.LINEAR,d); allocTargets(); markDirty(); }
+function setFloatDepth(e){ del(S.depthTex); del(S.depthFbo);
+  const z=new Float32Array(e.w*e.h); for(let i=0;i<z.length;i++){ const v=e.data[i*e.ch]; z[i]=Number.isFinite(v)&&v>0?v:1e4; }
+  S.depthTex=tex(e.w,e.h,gl.R32F,gl.RED,gl.FLOAT,gl.NEAREST,z); S.depthFbo=fbo(S.depthTex);
+  S.depthMode=2; S.depthKind='float'; S.depthW=e.w; S.depthH=e.h; updateDepthUI(); markDirty(); }
+function busy(msg){ document.getElementById('status').textContent=msg; }
+// Colour: EXR → float HDR path, anything else → browser image decoder (8-bit).
+function showLoaded(name){ const sel=document.getElementById('source'); let o=[...sel.options].find(x=>x.value==='shared');
+  if(!o){ o=new Option('','shared'); sel.add(o,0); } o.textContent=name; sel.value='shared'; lastSrc='shared'; }
+async function loadColor(blob, name=blob?.name||'Shared image'){ if(!blob) return;
+  if(await isEXR(blob)){ busy('Decoding EXR…');
+    try{ setHDRImage(await decodeEXR(blob)); showLoaded(name); } catch(err){ console.error(err); busy(''); alert('Could not read this EXR: '+err.message); } }
+  else loadImg(blob, img=>{ setImageSource(img); URL.revokeObjectURL(img.src); showLoaded(name); }); }
+async function loadDepth(blob){ if(!blob) return;
+  if(await isEXR(blob)){ busy('Decoding depth EXR…');
+    try{ const e=await decodeEXR(blob);
+      if(e.w!==S.W||e.h!==S.H) alert(`Depth EXR is ${e.w}×${e.h}, image is ${S.W}×${S.H}; it will be stretched to fit.`);
+      setFloatDepth(e); } catch(err){ console.error(err); busy(''); alert('Could not read this depth EXR: '+err.message); } }
+  else loadImg(blob,setDepthImage); }
 function readDepth(u,v){ if(!S.depthMode) return null; gl.bindFramebuffer(gl.FRAMEBUFFER,S.depthFbo);
   const x=Math.min(S.depthW-1,Math.floor(u*S.depthW)), y=Math.min(S.depthH-1,Math.floor(v*S.depthH));
   if(S.depthKind==='float'){ const b=new Float32Array(4); gl.readPixels(x,y,1,1,gl.RGBA,gl.FLOAT,b); return b[0]; }
@@ -573,15 +613,15 @@ srcSel.onchange=()=>{ const v=srcSel.value; if(v==='open'){ srcSel.value=lastSrc
   if(v==='shared'){ srcSel.value=lastSrc; return; }
   lastSrc=v; if(v==='scene') setSceneSource(); else setImageSource(v==='test'?testPattern():branches()); };
 function loadImg(f,cb){ if(!f) return; const img=new Image(); img.onload=()=>cb(img); img.src=URL.createObjectURL(f); }
-document.getElementById('file').onchange=e=>loadImg(e.target.files[0],setImageSource);
+document.getElementById('file').onchange=e=>{ loadColor(e.target.files[0]); e.target.value=''; };
 document.getElementById('loadDepth').onclick=()=>document.getElementById('depthFile').click();
-document.getElementById('depthFile').onchange=e=>loadImg(e.target.files[0],setDepthImage);
+document.getElementById('depthFile').onchange=e=>{ loadDepth(e.target.files[0]); e.target.value=''; };
 document.getElementById('clearDepth').onclick=()=>{ clearDepth(); markDirty(); };
 document.getElementById('save').onclick=()=>cv.toBlob(b=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download='chromatic-aberration.png'; a.click(); });
 const drop=document.getElementById('drop');
 addEventListener('dragover',e=>{ e.preventDefault(); drop.style.display='flex'; });
 addEventListener('dragleave',e=>{ if(e.target===drop) drop.style.display='none'; });
-addEventListener('drop',e=>{ e.preventDefault(); drop.style.display='none'; loadImg(e.dataTransfer.files[0],setImageSource); });
+addEventListener('drop',e=>{ e.preventDefault(); drop.style.display='none'; loadColor(e.dataTransfer.files[0]); });
 
 setPalette(0); applyLook('vintage'); setSceneSource();
 
@@ -599,9 +639,7 @@ function applySettings(v){
 addEventListener('message',e=>{
   if(e.origin!==location.origin || !e.data || typeof e.data!=='object') return;
   if(e.data.type==='ca-image' && e.data.blob instanceof Blob){
-    loadImg(e.data.blob, img=>{ setImageSource(img); URL.revokeObjectURL(img.src); });
-    let o=[...srcSel.options].find(x=>x.value==='shared'); if(!o){ o=new Option('Shared image','shared'); srcSel.add(o,0); }
-    srcSel.value=lastSrc='shared';
+    loadColor(e.data.blob, e.data.name||'Shared image');
   } else if(e.data.type==='ca-set') applySettings(e.data.values||{});
   else if(e.data.type==='ca-view') applyView(e.data);
   else if(e.data.type==='ca-hello') announce();
